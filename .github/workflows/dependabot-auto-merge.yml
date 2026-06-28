@@ -1,0 +1,34 @@
+# managed-by: github-policies
+name: Auto-merge Dependabot PRs
+
+# Uses pull_request_target to run in base repo context with full token access.
+# Safe because there is no checkout step — no untrusted PR code is executed.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+    branches: [master, main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only patch/minor bumps auto-merge. Majors stay open for manual review.
+      # No `gh pr review --approve` step: GitHub Actions cannot approve PRs, and
+      # these repos have no required-review branch protection, so merge needs no approval.
+      - name: Merge patch/minor PRs
+        if: steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor'
+        run: gh pr merge --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
