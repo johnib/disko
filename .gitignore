@@ -19,5 +19,4 @@ Thumbs.db
 .idea/
 *.swp
 
-# add your own locally
-docs/screenshot.png
+# docs/screenshot.png  (included in repo)
