@@ -20,7 +20,7 @@ from urllib.parse import urlparse, parse_qs
 __version__ = "1.0.0"
 _default_path = "/"
 
-SCAN_WORKERS  = 12   # parallel du workers per scan
+SCAN_WORKERS = 12   # parallel du workers per scan
 PREFETCH_WORKERS = 4  # background prefetch workers
 CACHE_FILE = os.path.expanduser('~/.disko_cache.json')
 PREFETCH_TOP_N = 10  # prefetch top-N largest subdirs after each scan
@@ -99,7 +99,7 @@ def scan_to_list(path: str) -> list:
     except PermissionError:
         return []
 
-    dirs  = [e for e in entries if e.is_dir(follow_symlinks=False)]
+    dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
     files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
 
     file_total = sum(
@@ -210,7 +210,7 @@ def stream_directory(path: str, write_event, force: bool = False):
         write_event({'type': 'error', 'error': str(e)})
         return
 
-    dirs  = [e for e in entries if e.is_dir(follow_symlinks=False)]
+    dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
     files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
     file_total = sum(
         e.stat(follow_symlinks=False).st_size for e in files if _safe_stat(e)
@@ -308,7 +308,8 @@ body {
 
 /* ── Progress bar ── */
 #progress-bar { height: 2px; background: #1e2535; flex-shrink: 0; transition: opacity .4s; }
-#progress-fill { height: 100%; background: #e94560; width: 0; transition: width .2s ease-out; box-shadow: 0 0 6px #e94560; }
+#progress-fill { height: 100%; background: #e94560; width: 0;
+  transition: width .2s ease-out; box-shadow: 0 0 6px #e94560; }
 
 /* ── Body ── */
 #body { flex: 1; display: flex; overflow: hidden; }
@@ -363,7 +364,8 @@ body {
 .sitem.file { cursor: default; }
 .sitem-top { display: flex; align-items: center; gap: 7px; }
 .sitem-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.sitem-name { flex: 1; font-size: 12px; color: #cbd5e1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sitem-name { flex: 1; font-size: 12px; color: #cbd5e1;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sitem-size { font-size: 11px; color: #64748b; white-space: nowrap; }
 .sitem-actions { display: flex; align-items: center; gap: 3px; opacity: 0; transition: opacity .15s; }
 .sitem:hover .sitem-actions { opacity: 1; }
@@ -408,7 +410,8 @@ body {
   <span id="app-title">Disk Explorer</span>
   <div id="breadcrumb"></div>
   <div id="header-right">
-    <form id="path-form"><input id="path-input" type="text" placeholder="Jump to path…" spellcheck="false" autocomplete="off"/></form>
+    <form id="path-form"><input id="path-input" type="text"
+      placeholder="Jump to path…" spellcheck="false" autocomplete="off"/></form>
     <div id="total-size">Size: <span>—</span></div>
     <button class="hdr-btn" id="refresh-btn" title="Refresh current folder">↺ Refresh</button>
     <button class="hdr-btn" id="back-btn">← Back</button>
@@ -764,7 +767,7 @@ class Handler(BaseHTTPRequestHandler):
 
         elif parsed.path == '/stream':
             params = parse_qs(parsed.query)
-            path  = params.get('path',  [os.path.expanduser('~')])[0]
+            path = params.get('path', [os.path.expanduser('~')])[0]
             force = params.get('force', ['0'])[0] == '1'
 
             self.send_response(200)
@@ -832,6 +835,7 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         print("Stopped.")
+
 
 if __name__ == "__main__":
     main()
