@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "disko"
+version = "1.0.0"
+description = "Interactive disk usage explorer"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.license]
+text = "MIT"
+
+[[project.authors]]
+name = "Jonathan Ba"
+
+[project.keywords]
+keywords = ["disk", "usage", "filesystem", "visualization", "treemap", "storage", "du"]
+
+[project.classifiers]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Filesystems",
+]
+
+[project.urls]
+Homepage = "https://github.com/johnib/disko"
+Issues = "https://github.com/johnib/disko/issues"
+
+[project.scripts]
+disko = "disko:main"

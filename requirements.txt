@@ -1,0 +1,18 @@
+# No Python dependencies — stdlib only.
+#
+# Standard library modules used:
+#   concurrent.futures
+#   http.server
+#   json
+#   os
+#   platform
+#   subprocess
+#   threading
+#   time
+#   urllib.parse
+#   webbrowser
+#
+# D3.js is loaded from CDN at runtime (no local install needed).
+#
+# For development linting only:
+#   flake8
