@@ -99,6 +99,6 @@ Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for gu
 
 ## License
 
-MIT License. Copyright (c) Jonathan Ba.
+MIT License. Copyright (c) [Jonathan Barazany](https://barazany.dev).
 
 See [LICENSE](LICENSE) for the full text.
