@@ -86,6 +86,8 @@ python3 disko.py --path /data --no-browser
 |---|---|
 | Location | `~/.disko_cache.json` (in your home directory, outside the repository; override with the `DISKO_CACHE` environment variable) |
 | Clear cache | `rm ~/.disko_cache.json` |
+| Writes | Atomic (temp file + rename), file mode `0600`; never saved when running as root |
+| Corrupt file | Ignored with a warning; disko starts with an empty cache |
 
 The cache stores one entry per scanned folder (including prefetched folders). Entries are keyed by absolute path and hold the folder's immediate children with their sizes, plus a `scanned_at` timestamp that the UI shows as the scan time.
 

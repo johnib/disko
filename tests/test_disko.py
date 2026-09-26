@@ -75,6 +75,9 @@ class TempTreeMixin(object):
         self.cache_dir = tempfile.mkdtemp(prefix='disko-cache-')
         self._orig_cache_file = disko.CACHE_FILE
         disko.CACHE_FILE = os.path.join(self.cache_dir, 'cache.json')
+        # Persist even if the suite happens to run as root (disko skips saving as euid 0).
+        self._orig_persist = disko._persist_cache
+        disko._persist_cache = True
         self._threads_before = set(threading.enumerate())
         with disko._cache_lock:
             disko._cache.clear()
@@ -89,6 +92,7 @@ class TempTreeMixin(object):
         with disko._cache_lock:
             disko._cache.clear()
         disko.CACHE_FILE = self._orig_cache_file
+        disko._persist_cache = self._orig_persist
         shutil.rmtree(self.cache_dir, ignore_errors=True)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -185,6 +189,51 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
             f.write('{not json')
         disko.cache_load()
         self.assertEqual(disko._cache, {})
+
+    def test_load_non_object_json_is_ignored(self):
+        with open(disko.CACHE_FILE, 'w') as f:
+            json.dump([1, 2], f)
+        disko.cache_load()
+        self.assertEqual(disko._cache, {})
+
+    def test_save_is_private_atomic_and_leaves_no_temp_files(self):
+        disko.cache_set(self.root, [])
+        if os.name == 'posix':
+            self.assertEqual(os.stat(disko.CACHE_FILE).st_mode & 0o777, 0o600)
+        self.assertEqual(os.listdir(self.cache_dir), ['cache.json'])
+
+    @unittest.skipUnless(hasattr(os, 'symlink') and os.name == 'posix', 'needs symlinks')
+    def test_save_does_not_write_through_symlink(self):
+        victim = os.path.join(self.cache_dir, 'victim.txt')
+        with open(victim, 'w') as f:
+            f.write('V')
+        os.symlink(victim, disko.CACHE_FILE)
+        disko.cache_set(self.root, [])
+        with open(victim) as f:
+            self.assertEqual(f.read(), 'V')
+        self.assertFalse(os.path.islink(disko.CACHE_FILE))
+
+    def test_failed_save_keeps_old_cache(self):
+        disko.cache_set(self.root, [])
+        with open(disko.CACHE_FILE) as f:
+            before = f.read()
+        orig_replace = disko.os.replace
+
+        def boom(*a, **k):
+            raise OSError('simulated failure')
+        disko.os.replace = boom
+        try:
+            disko.cache_set(os.path.join(self.root, 'big'), [])
+        finally:
+            disko.os.replace = orig_replace
+        with open(disko.CACHE_FILE) as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(os.listdir(self.cache_dir), ['cache.json'])
+
+    def test_no_save_when_persistence_disabled(self):
+        disko._persist_cache = False
+        disko.cache_set(self.root, [])
+        self.assertFalse(os.path.exists(disko.CACHE_FILE))
 
 
 class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
