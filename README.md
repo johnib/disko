@@ -90,7 +90,9 @@ python3 disko.py --path /data --no-browser
 | Writes | Atomic (temp file + rename), file mode `0600`; never saved when running as root |
 | Corrupt file | Ignored with a warning; disko starts with an empty cache |
 
-The cache stores one entry per scanned folder (including prefetched folders). Entries are keyed by absolute, normalized path (`~`, `..` and trailing slashes resolve to the same entry) and hold the folder's immediate children with their sizes, plus a `scanned_at` timestamp that the UI shows as the scan time.
+The cache stores one entry per scanned folder (including prefetched folders). Entries are keyed by absolute, normalized path (`~`, `..` and trailing slashes resolve to the same entry) and hold the folder's immediate children with their sizes, plus a `scanned_at` timestamp recording when the scan started, which the UI shows as the scan time.
+
+Cached results are shown instantly. If an entry is older than `CACHE_TTL` (5 minutes by default), disko keeps the connection open, rescans the folder in the background, and swaps in the fresh results when the rescan finishes. When a folder is rescanned, its new size is also written into the cached entries of its parent folders. A scan never overwrites an entry written by a scan that started later.
 
 ---
 
