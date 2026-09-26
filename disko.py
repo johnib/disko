@@ -447,7 +447,9 @@ def stream_directory(path: str, write_event, force: bool = False, stop=None):
     dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
     files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
     file_total = sum(_alloc_size(e) for e in files)
-    total_dirs = len(dirs)
+    # Counted before the mount split (mounts are emitted as children too), +1 for the
+    # "(loose files)" entry sent after the dirs, so progress never exceeds 100%.
+    total_dirs = len(dirs) + (1 if file_total > 0 else 0)
     dirs, mounts = _split_mounts(path, dirs)
 
     write_event({
@@ -523,15 +525,16 @@ body {
 #app-title { font-size: 14px; font-weight: 700; color: #f1f5f9; white-space: nowrap; }
 #breadcrumb { display: flex; align-items: center; flex: 1; gap: 2px; overflow: hidden; min-width: 0; }
 .crumb {
-  font-size: 12px; color: #64748b; cursor: pointer;
+  font: inherit; font-size: 12px; color: #94a3b8; cursor: pointer;
+  background: transparent; border: none;
   padding: 3px 6px; border-radius: 4px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px;
-  transition: all .15s;
+  min-width: 24px; flex-shrink: 1; transition: all .15s;
 }
 .crumb:hover { background: #1e2535; color: #cbd5e1; }
-.crumb.active { color: #f1f5f9; font-weight: 500; cursor: default; }
+.crumb.active { color: #f1f5f9; font-weight: 500; cursor: default; flex-shrink: 0; }
 .crumb.active:hover { background: transparent; }
-.crumb-sep { color: #2d3748; font-size: 13px; flex-shrink: 0; }
+.crumb-sep { color: #8391a7; font-size: 13px; flex-shrink: 0; }
 
 #header-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 #path-form { display: flex; }
@@ -541,7 +544,7 @@ body {
   outline: none; width: 230px; font-family: 'SF Mono', monospace; transition: border-color .15s;
 }
 #path-input:focus { border-color: #e94560; color: #f1f5f9; }
-#total-size { font-size: 12px; color: #64748b; white-space: nowrap; }
+#total-size { font-size: 12px; color: #94a3b8; white-space: nowrap; }
 #total-size span { color: #e94560; font-weight: 700; }
 
 .hdr-btn {
@@ -550,6 +553,13 @@ body {
   cursor: pointer; transition: all .15s; white-space: nowrap;
 }
 .hdr-btn:hover { background: #2d3748; color: #f1f5f9; }
+.hdr-btn:disabled { opacity: .5; cursor: default; }
+.hdr-btn:disabled:hover { background: #1e2535; color: #94a3b8; }
+button:focus-visible, [tabindex]:focus-visible { outline: 2px solid #e94560; outline-offset: 1px; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+}
 #back-btn { display: none; }
 #back-btn.visible { display: block; }
 #refresh-btn.spinning { animation: spin .7s linear infinite; }
@@ -580,13 +590,13 @@ body {
   border-left: 1px solid #1e2535; display: flex; flex-direction: column; overflow: hidden;
 }
 #sidebar-header {
-  padding: 10px 16px 9px; font-size: 11px; font-weight: 600; color: #475569;
+  padding: 10px 16px 9px; font-size: 11px; font-weight: 600; color: #8391a7;
   text-transform: uppercase; letter-spacing: .8px; border-bottom: 1px solid #1e2535;
   display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; gap: 6px;
 }
 #scan-badge {
   display: flex; align-items: center; gap: 5px;
-  font-size: 10px; color: #64748b; font-weight: 400; letter-spacing: 0;
+  font-size: 10px; color: #94a3b8; font-weight: 400; letter-spacing: 0;
 }
 .scan-dot {
   width: 6px; height: 6px; border-radius: 50%; background: #e94560;
@@ -596,7 +606,7 @@ body {
 @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.3;transform:scale(.65)} }
 
 #cache-badge {
-  font-size: 10px; color: #334155; padding: 2px 6px; border-radius: 4px;
+  font-size: 10px; color: #8391a7; padding: 2px 6px; border-radius: 4px;
   background: #1e2535; border: 1px solid #2d3748; white-space: nowrap; display: none;
 }
 #cache-badge.show { display: block; }
@@ -606,13 +616,18 @@ body {
 #sidebar-list::-webkit-scrollbar-thumb { background: #2d3748; border-radius: 2px; }
 
 .sitem {
-  display: flex; flex-direction: column; padding: 8px 16px 7px;
-  border-bottom: 1px solid #1a2030; cursor: pointer; transition: background .1s; gap: 4px;
+  display: flex; align-items: center; gap: 3px; padding-right: 10px;
+  border-bottom: 1px solid #1a2030; transition: background .1s;
   animation: fadeSlide .18s ease-out both;
+}
+.sitem-main {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px;
+  padding: 8px 6px 7px 16px; font: inherit; color: inherit; text-align: left;
+  background: transparent; border: none; cursor: pointer;
 }
 @keyframes fadeSlide { from{opacity:0;transform:translateX(8px)} to{opacity:1;transform:translateX(0)} }
 .sitem:hover { background: #1e2535; }
-.sitem.file { cursor: default; }
+.sitem.file .sitem-main { cursor: default; }
 .sitem.unknown .sitem-size { color: #f59e0b; font-style: italic; }
 .sitem.mount .sitem-name { font-style: italic; }
 .sitem.mount .sitem-bar-wrap { visibility: hidden; }
@@ -620,16 +635,19 @@ body {
 .sitem-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .sitem-name { flex: 1; font-size: 12px; color: #cbd5e1;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sitem-size { font-size: 11px; color: #64748b; white-space: nowrap; }
+.sitem-size { font-size: 11px; color: #94a3b8; white-space: nowrap; }
 .sitem-actions { display: flex; align-items: center; gap: 3px; opacity: 0; transition: opacity .15s; }
-.sitem:hover .sitem-actions { opacity: 1; }
+.sitem:hover .sitem-actions, .sitem:focus-within .sitem-actions { opacity: 1; }
+@media (hover: none) { .sitem-actions { opacity: 1; } }
 .sitem-cached { font-size: 9px; color: #1d4ed8; background: #1e3a5f; padding: 1px 4px; border-radius: 3px; }
 .sitem-refresh-btn {
   font-size: 11px; padding: 1px 5px; border-radius: 3px; cursor: pointer;
-  color: #475569; background: transparent; border: none;
+  color: #94a3b8; background: transparent; border: none;
   transition: all .15s; line-height: 1.4;
 }
-.sitem-refresh-btn:hover { background: #2d3748; color: #e94560; }
+.sitem-refresh-btn:hover { background: #2d3748; color: #f47a8f; }
+.sitem-refresh-btn.spinning { animation: spin .7s linear infinite; color: #f47a8f; cursor: progress; }
+.sitem-refresh-btn.failed { color: #f47a8f; }
 .sitem-bar-wrap { height: 2px; background: #1e2535; border-radius: 1px; margin-left: 15px; width: calc(100% - 15px); }
 .sitem-bar { height: 100%; border-radius: 1px; opacity: .45; }
 
@@ -641,7 +659,15 @@ body {
 }
 #error-overlay.show, #d3-overlay.show { display: flex; }
 #error-title, #d3-title { color: #e94560; font-size: 15px; font-weight: 600; }
-#error-detail, #d3-detail { color: #475569; font-size: 12px; }
+#error-detail, #d3-detail { color: #94a3b8; font-size: 12px; }
+
+/* ── Empty state ── */
+#empty-state {
+  position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+  color: #94a3b8; font-size: 13px; pointer-events: none;
+}
+#empty-state.show { display: flex; }
+.sidebar-empty { padding: 14px 16px; font-size: 12px; color: #94a3b8; }
 
 /* ── Tooltip ── */
 #tooltip {
@@ -650,25 +676,39 @@ body {
   display: none; box-shadow: 0 8px 32px rgba(0,0,0,.5); max-width: 300px;
 }
 .tt-name { font-weight: 600; color: #f1f5f9; margin-bottom: 3px; word-break: break-word; }
-.tt-path { font-size: 11px; color: #475569; margin-bottom: 8px; word-break: break-all; }
-.tt-size { font-size: 18px; font-weight: 700; color: #e94560; }
-.tt-pct  { font-size: 11px; color: #64748b; margin-top: 2px; }
-.tt-cached { font-size: 10px; color: #334155; margin-top: 4px; }
-.tt-hint { margin-top: 8px; font-size: 11px; color: #334155; border-top: 1px solid #2d3748; padding-top: 7px; }
+.tt-path { font-size: 11px; color: #8391a7; margin-bottom: 8px; word-break: break-all; }
+.tt-size { font-size: 18px; font-weight: 700; color: #f26b83; }
+.tt-pct  { font-size: 11px; color: #94a3b8; margin-top: 2px; }
+.tt-cached { font-size: 10px; color: #94a3b8; margin-top: 4px; }
+.tt-hint { margin-top: 8px; font-size: 11px; color: #8391a7; border-top: 1px solid #2d3748; padding-top: 7px; }
+
+/* ── Narrow windows ── */
+@media (max-width: 760px) {
+  #header { flex-wrap: wrap; height: auto; padding: 6px 10px; gap: 6px 10px; }
+  #app-title { display: none; }
+  #breadcrumb { order: 3; flex-basis: 100%; }
+  #header-right { flex: 1; justify-content: flex-end; flex-wrap: wrap; min-width: 0; }
+  #path-form { flex: 1; min-width: 120px; }
+  #path-input { width: 100%; }
+  #body { flex-direction: column; }
+  #treemap-wrap { flex: 1 1 55%; min-height: 160px; }
+  #sidebar { width: auto; flex: 1 1 45%; min-height: 0; border-left: none; border-top: 1px solid #1e2535; }
+}
 </style>
 </head>
 <body>
 
 <div id="header">
-  <span id="logo">🗂</span>
+  <span id="logo" aria-hidden="true">🗂</span>
   <span id="app-title">Disk Explorer</span>
-  <div id="breadcrumb"></div>
+  <nav id="breadcrumb" aria-label="Current path"></nav>
   <div id="header-right">
-    <form id="path-form"><input id="path-input" type="text"
-      placeholder="Jump to path…" spellcheck="false" autocomplete="off"/></form>
+    <form id="path-form" role="search"><label for="path-input" class="sr-only">Jump to path</label><input
+      id="path-input" type="text" placeholder="Jump to path…" spellcheck="false" autocomplete="off"/></form>
     <div id="total-size">Size: <span>—</span></div>
+    <button class="hdr-btn" id="up-btn" title="Go to parent folder" aria-label="Go to parent folder">↑ Up</button>
     <button class="hdr-btn" id="refresh-btn" title="Refresh current folder">↺ Refresh</button>
-    <button class="hdr-btn" id="back-btn">← Back</button>
+    <button class="hdr-btn" id="back-btn" title="Back (Backspace or Left arrow)">← Back</button>
   </div>
 </div>
 
@@ -676,12 +716,13 @@ body {
 
 <div id="body">
   <div id="treemap-wrap">
-    <svg id="treemap"></svg>
-    <div id="error-overlay">
+    <svg id="treemap" role="img" aria-label="Treemap of folder contents by size"></svg>
+    <div id="empty-state">This folder is empty</div>
+    <div id="error-overlay" role="alert">
       <div id="error-title">⚠ Could not scan</div>
       <div id="error-detail"></div>
     </div>
-    <div id="d3-overlay">
+    <div id="d3-overlay" role="alert">
       <div id="d3-title">⚠ Treemap unavailable</div>
       <div id="d3-detail">Could not load the D3 library from cdn.jsdelivr.net (offline or CDN blocked).
         The sidebar list still works.</div>
@@ -692,7 +733,7 @@ body {
       <span>Contents</span>
       <div style="display:flex;align-items:center;gap:6px">
         <span id="cache-badge"></span>
-        <span id="scan-badge">
+        <span id="scan-badge" role="status">
           <span class="scan-dot" id="scan-dot"></span>
           <span id="scan-text"></span>
         </span>
@@ -723,13 +764,17 @@ let navGen = 0;       // bumped on every navigation; stale stream callbacks bail
 let lastPath = null;  // last requested path, so Refresh can retry a failed first load
 let pendingRender = null;    // { fn, handle } for the next animation-frame flush
 let resizeTimer = null;
+const refreshingPaths = new Set();  // per-row refreshes in flight
+let lastMouse = null;               // last pointer position over the treemap (for live tooltip)
 
 function fmt(b) {
   if (!b || b <= 0) return '0 B';
   const u = ['B','KB','MB','GB','TB'];
-  const i = Math.min(4, Math.floor(Math.log(b) / Math.log(1024)));
-  const v = b / Math.pow(1024, i);
-  return (i >= 2 ? v.toFixed(1) : Math.round(v)) + ' ' + u[i];
+  let i = Math.min(4, Math.floor(Math.log(b) / Math.log(1024)));
+  const shown = k => { const v = b / Math.pow(1024, k); return k >= 2 ? v.toFixed(1) : String(Math.round(v)); };
+  // Roll over to the next unit when rounding reaches 1024 (e.g. never show "1024.0 MB")
+  if (i < 4 && Number(shown(i)) >= 1024) i++;
+  return shown(i) + ' ' + u[i];
 }
 // Children whose du failed carry size:null plus a status ('timeout' or an
 // error); du totals that skipped unreadable subdirs carry status 'partial'.
@@ -746,12 +791,19 @@ function statusText(c) {
   if (c.status === 'timeout') return 'Size unknown: du timed out';
   return 'Size unknown: du failed';
 }
+function sumSizes(list) { return list.reduce((s,c) => s+(c.size||0), 0); }
 function pctOf(a, b) { return b ? ((a/b)*100).toFixed(1)+'%' : '—'; }
 function timeAgo(ts) {
-  const s = Math.round(Date.now()/1000 - ts);
+  const s = Math.max(0, Math.round(Date.now()/1000 - ts));
   if (s < 60)  return `${s}s ago`;
-  if (s < 3600) return `${Math.round(s/60)}m ago`;
-  return `${Math.round(s/3600)}h ago`;
+  if (s < 3600) return `${Math.floor(s/60)}m ago`;
+  if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+  return `${Math.floor(s/86400)}d ago`;
+}
+function parentOf(p) {
+  const t = (p || '').replace(/\/+$/, '');
+  const i = t.lastIndexOf('/');
+  return i <= 0 ? '/' : t.slice(0, i);
 }
 
 // Keep the largest (max-1) items and fold the rest into one aggregate entry.
@@ -838,7 +890,7 @@ function navigate(path, force, onCommit) {
   setScanStatus('scanning…', false);
 
   let items = [];
-  let meta = null, totalDirs = 0, received = 0, total = 0, refreshing = false;
+  let meta = null, totalDirs = 0, received = 0, refreshing = false;
 
   startStream(path, force, gen, {
     onStart(msg) {
@@ -856,7 +908,7 @@ function navigate(path, force, onCommit) {
       // Stale cache was re-scanned: buffer the fresh listing, swap it in on done
       flushRender();
       meta = msg; totalDirs = msg.total_dirs; received = 0;
-      items = []; total = 0; refreshing = true;
+      items = []; refreshing = true;
     },
     onChild(item) {
       received++;
@@ -864,13 +916,13 @@ function navigate(path, force, onCommit) {
       let lo = 0, hi = items.length;
       while (lo < hi) { const mid = (lo+hi)>>1; (items[mid].size||0) >= (item.size||0) ? lo=mid+1 : hi=mid; }
       items.splice(lo, 0, item);
-      total += (item.size||0);
       if (refreshing) return;
       const n = received;
       scheduleRender(() => {
         if (gen !== navGen) return;
-        renderData({ path: meta.path, name: meta.name, size: total, children: items.slice() });
-        if (totalDirs > 0) setProgress(Math.round((n/totalDirs)*100));
+        // Summed once per frame (not per event) so a row refresh's new size is picked up too.
+        renderData({ path: meta.path, name: meta.name, size: sumSizes(items), children: items.slice() });
+        if (totalDirs > 0) setProgress(Math.min(100, Math.round((n/totalDirs)*100)));
         setScanStatus(`${n} / ${totalDirs}`, false);
       });
     },
@@ -878,8 +930,9 @@ function navigate(path, force, onCommit) {
       flushRender();
       if (refreshing) {
         hideCacheBadge();
-        renderData({ path: meta.path, name: meta.name, size: total, children: items.slice() });
+        renderData({ path: meta.path, name: meta.name, size: sumSizes(items), children: items.slice() });
       }
+      if (currentData) { currentData.done = true; updateEmptyState(currentData); }
       setProgress(100);
       setScanStatus('done ✓', true);
       setTimeout(() => { if (gen === navGen) { setProgress(-1); setScanStatus('', true); } }, 1500);
@@ -910,8 +963,53 @@ function refreshCurrent(force=true) {
 function refreshPath(path) {
   // If this IS the current path, just refresh current
   if (currentData && currentData.path === path) { refreshCurrent(true); return; }
-  // Otherwise just invalidate cache silently (server handles it on next visit)
-  fetch(`${API}/invalidate?path=${encodeURIComponent(path)}`).catch(()=>{});
+  if (refreshingPaths.has(path)) return;
+  // Otherwise force a rescan of that folder (which also refreshes its cache entry),
+  // show a spinner on its row meanwhile, and update its size in the current view.
+  const parentPath = currentData ? currentData.path : null;
+  refreshingPaths.add(path);
+  setRowRefreshState(path, 'spinning');
+  let total = 0, partial = false, finished = false;
+  const es = new EventSource(`${API}/stream?path=${encodeURIComponent(path)}&force=1`);
+  const finish = ok => {
+    if (finished) return;
+    finished = true;
+    es.close();
+    refreshingPaths.delete(path);
+    setRowRefreshState(path, ok ? '' : 'failed');
+    if (!ok || !currentData || currentData.path !== parentPath) return;
+    const item = (currentData.children || []).find(c => c.path === path && c.isDir !== false);
+    if (!item) return;
+    item.size = total;  // shared with the stream's item list, so later child events keep it
+    // A child with an unknown or partial size makes the new total a lower bound.
+    if (partial) item.status = 'partial'; else delete item.status;
+    currentData.children.sort((a, b) => (b.size||0) - (a.size||0));
+    currentData.size = sumSizes(currentData.children);
+    renderData(currentData);
+    if (currentData.done) updateEmptyState(currentData);
+  };
+  es.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'child') { total += msg.size || 0; if (msg.status) partial = true; }
+    if (msg.type === 'done') finish(true);
+    if (msg.type === 'error') finish(false);
+  };
+  es.onerror = () => finish(false);
+}
+
+function setRowRefreshState(path, state) {
+  document.querySelectorAll('#sidebar-list .sitem-refresh-btn').forEach(btn => {
+    if (btn.dataset.path !== path) return;
+    btn.classList.toggle('spinning', state === 'spinning');
+    btn.classList.toggle('failed', state === 'failed');
+    btn.setAttribute('aria-busy', state === 'spinning' ? 'true' : 'false');
+    btn.title = state === 'failed' ? 'Refresh failed; click to retry' : 'Refresh this folder';
+  });
+}
+
+function goUp() {
+  if (!currentData || !currentData.path || currentData.path === '/') return;
+  goTo(parentOf(currentData.path));
 }
 
 function goBack() {
@@ -940,8 +1038,24 @@ function render(data) {
   renderBreadcrumb();
   renderSidebar(data);
   renderTreemap(data);
+  updateEmptyState(data);
   document.getElementById('back-btn').classList.toggle('visible', navStack.length > 0);
+  document.getElementById('up-btn').disabled = !data.path || data.path === '/';
   document.querySelector('#total-size span').textContent = fmt(data.size);
+}
+
+// "Empty" is only known once the scan finished (data.done); hide it while children stream in.
+function updateEmptyState(data) {
+  // Unknown-size (du failed) entries and mount points still count as content.
+  const empty = !!data.done && !(data.children || []).some(c => hasSizeInfo(c) || c.mount);
+  document.getElementById('empty-state').classList.toggle('show', empty);
+  if (!empty) return;
+  const list = document.getElementById('sidebar-list');
+  list.textContent = '';
+  const msg = document.createElement('div');
+  msg.className = 'sidebar-empty';
+  msg.textContent = 'No items';
+  list.appendChild(msg);
 }
 
 // Partial update (during streaming) - skip nav stack update
@@ -966,20 +1080,27 @@ function el(tag, cls, text) {
   return e;
 }
 
+// Crumbs are derived from the current path itself (not click history), so every
+// ancestor up to "/" is reachable. Clicks go through goTo(), which cancels any
+// in-flight stream (navGen bump) and pushes the current view onto the Back stack.
 function renderBreadcrumb() {
   const bc = document.getElementById('breadcrumb');
-  bc.innerHTML = '';
-  const chain = [...navStack, currentData].filter(Boolean);
+  bc.textContent = '';
+  if (!currentData || !currentData.path) return;
+  const parts = currentData.path.split('/').filter(Boolean);
+  const chain = [{ name: '/', path: '/' }];
+  parts.forEach((part, i) => chain.push({ name: part, path: '/' + parts.slice(0, i + 1).join('/') }));
   chain.forEach((item, i) => {
-    const name = item.name || (item.path||'').split('/').pop() || item.path;
-    const span = document.createElement('span');
-    span.className = 'crumb' + (i === chain.length-1 ? ' active' : '');
-    span.title = item.path;
-    span.textContent = name;
-    if (i < chain.length-1) span.onclick = () => { cancelStream(); navStack = navStack.slice(0,i); renderFull(item); };
-    bc.appendChild(span);
-    if (i < chain.length-1) {
+    const last = i === chain.length-1;
+    const btn = el('button', 'crumb' + (last ? ' active' : ''), item.name);
+    btn.type = 'button';
+    btn.title = item.path;
+    if (last) btn.setAttribute('aria-current', 'page');
+    else btn.addEventListener('click', () => goTo(item.path));
+    bc.appendChild(btn);
+    if (!last && i > 0) {
       const sep = document.createElement('span'); sep.className='crumb-sep'; sep.textContent=' › ';
+      sep.setAttribute('aria-hidden', 'true');
       bc.appendChild(sep);
     }
   });
@@ -1013,14 +1134,58 @@ function d3Available() {
   return ok;
 }
 
+// Pick black or white label text, whichever contrasts more with the cell fill (WCAG luminance).
+function labelColor(fill) {
+  const c = d3.rgb(fill);
+  const lin = v => { v /= 255; return v <= 0.03928 ? v/12.92 : Math.pow((v+0.055)/1.055, 2.4); };
+  const L = 0.2126*lin(c.r) + 0.7152*lin(c.g) + 0.0722*lin(c.b);
+  return (L + 0.05) / 0.05 >= 1.05 / (L + 0.05) ? '#000000' : '#ffffff';
+}
+
+function truncateLabel(name, max) {
+  const chars = Array.from(name);  // code points, so surrogate pairs are never split
+  return chars.length > max ? chars.slice(0, max-1).join('') + '…' : name;
+}
+
+function showTooltip(d, totalVal, x, y) {
+  const tooltip = document.getElementById('tooltip');
+  tooltip.textContent = '';
+  tooltip.append(
+    el('div', 'tt-name', d.data.name),
+    el('div', 'tt-path', d.data.path),
+    el('div', 'tt-size', sizeLabel(d.data)),
+    el('div', 'tt-pct', `${pctOf(d.data.size||0, totalVal)} of this view`));
+  if (d.data.status) tooltip.appendChild(el('div', 'tt-cached', statusText(d.data)));
+  if (d.data.isDir!==false) tooltip.appendChild(el('div', 'tt-hint', 'Click to drill down →'));
+  tooltip.style.display='block';
+  // Keep the whole tooltip inside the viewport on both axes
+  const w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+  let left = x + 14, top = y - 10;
+  if (left + w > window.innerWidth - 8) left = x - w - 14;
+  if (top + h > window.innerHeight - 8) top = window.innerHeight - h - 8;
+  tooltip.style.left = Math.max(8, left) + 'px';
+  tooltip.style.top = Math.max(8, top) + 'px';
+}
+
+// After a re-render (e.g. while streaming) refresh the tooltip for whatever cell is now under the pointer.
+function refreshTooltip(totalVal) {
+  const tooltip = document.getElementById('tooltip');
+  if (tooltip.style.display !== 'block' || !lastMouse) return;
+  const hit = document.elementFromPoint(lastMouse.x, lastMouse.y);
+  const g = hit && hit.closest ? hit.closest('#treemap g.cell') : null;
+  if (!g) { tooltip.style.display='none'; return; }
+  showTooltip(d3.select(g).datum(), totalVal, lastMouse.x, lastMouse.y);
+}
+
 function renderTreemap(data) {
   if (!d3Available()) return;
+  const tooltip = document.getElementById('tooltip');
   const wrap = document.getElementById('treemap-wrap');
-  const W = wrap.clientWidth-20, H = wrap.clientHeight-20;
+  const W = Math.max(0, wrap.clientWidth-20), H = Math.max(0, wrap.clientHeight-20);
   const svg = d3.select('#treemap').attr('width',W).attr('height',H);
   svg.selectAll('*').remove();
   const children = capChildren((data.children||[]).filter(hasSizeInfo), MAX_LEAVES, data.path);
-  if (!children.length) return;
+  if (!children.length) { tooltip.style.display='none'; return; }
   // Unknown / zero-size partial entries get a small nominal area so they stay visible.
   const knownTotal = children.reduce((s,c)=>s+(c.size||0),0);
   const stubSize = Math.max(1, knownTotal*0.02);
@@ -1035,7 +1200,6 @@ function renderTreemap(data) {
     return n.data.aggregate ? OTHER_COLOR : PALETTE[n.colorIdx%PALETTE.length];
   };
   const shade = (hex,depth) => { const c=d3.color(hex); return c?c.darker(depth*.35).toString():hex; };
-  const tooltip = document.getElementById('tooltip');
   const totalVal = knownTotal||1;
 
   const cell = svg.selectAll('g.cell').data(root.leaves()).enter()
@@ -1051,40 +1215,34 @@ function renderTreemap(data) {
 
   cell.each(function(d) {
     const cw=d.x1-d.x0, ch=d.y1-d.y0, g=d3.select(this);
+    // .cell.unknown rects are drawn #334155 by CSS, so pick the label colour for that fill.
+    const ink=labelColor(isUnknown(d.data) ? '#334155' : shade(colorOf(d),d.depth-1));
     if (cw>45&&ch>22) {
       const mc=Math.max(3,Math.floor((cw-12)/7.5));
-      const lbl=d.data.name.length>mc?d.data.name.slice(0,mc-1)+'…':d.data.name;
       g.append('text').attr('x',6).attr('y',16)
         .attr('font-size',Math.min(12,Math.max(9,cw/10)))
-        .attr('font-weight','500').attr('fill','rgba(255,255,255,.88)').text(lbl);
+        .attr('font-weight','600').attr('fill',ink).text(truncateLabel(d.data.name, mc));
     }
     if (cw>55&&ch>38)
       g.append('text').attr('x',6).attr('y',30).attr('font-size',10)
-        .attr('fill','rgba(255,255,255,.5)').text(sizeLabel(d.data));
+        .attr('fill',ink).text(sizeLabel(d.data));
   });
 
   cell
     .on('mousemove',(ev,d) => {
-      tooltip.style.display='block';
-      tooltip.style.left=Math.min(ev.clientX+14,window.innerWidth-320)+'px';
-      tooltip.style.top=Math.max(10,ev.clientY-10)+'px';
-      tooltip.textContent = '';
-      tooltip.append(
-        el('div','tt-name',d.data.name),
-        el('div','tt-path',d.data.path),
-        el('div','tt-size',sizeLabel(d.data)),
-        el('div','tt-pct',pctOf(d.data.size||0,totalVal)+' of this view'));
-      if (d.data.status) tooltip.appendChild(el('div','tt-cached',statusText(d.data)));
-      if (d.data.isDir!==false) tooltip.appendChild(el('div','tt-hint','Click to drill down →'));
+      lastMouse = { x: ev.clientX, y: ev.clientY };
+      showTooltip(d, totalVal, ev.clientX, ev.clientY);
     })
     .on('mouseleave',()=>{ tooltip.style.display='none'; })
     .on('click',(_,d)=>{ if(d.data.isDir===false)return; tooltip.style.display='none'; goTo(d.data.path); });
+
+  refreshTooltip(totalVal);
 }
 
 // ── Sidebar ──────────────────────────────────────────────────
 function renderSidebar(data) {
   const list = document.getElementById('sidebar-list');
-  list.innerHTML = '';
+  list.textContent = '';
   // Mount points have unknown size (0) but are still listed so they can be opened.
   const all = (data.children||[]).filter(c=>hasSizeInfo(c)||c.mount);
   if (!all.length) return;
@@ -1093,35 +1251,41 @@ function renderSidebar(data) {
 
   items.forEach((item,i) => {
     const color = PALETTE[i%PALETTE.length];
-    const div = document.createElement('div');
-    div.className = 'sitem'+(item.isDir===false?' file':'')+(item.status?' unknown':'')+(item.mount?' mount':'');
+    const isDir = item.isDir!==false;
+    const div = el('div', 'sitem'+(isDir?'':' file')+(item.status?' unknown':'')+(item.mount?' mount':''));
     if (item.status) div.title = statusText(item);
     div.style.animationDelay = Math.min(i*20,200)+'ms';
 
-    const top = el('div','sitem-top');
-    const dot = el('div','sitem-dot'); dot.style.background = color;
-    const name = el('div','sitem-name',item.name); name.title = item.path;
-    top.append(dot, name, el('div','sitem-size',sizeLabel(item)));
-    if (item.isDir!==false) {
-      const actions = el('div','sitem-actions');
-      const btn = el('button','sitem-refresh-btn','↺'); btn.title = 'Refresh this folder';
-      actions.appendChild(btn);
-      top.appendChild(actions);
+    // Folders get a real <button> (keyboard + screen reader); the refresh button is a sibling, not nested.
+    const main = el(isDir ? 'button' : 'div', 'sitem-main');
+    if (isDir) {
+      main.type = 'button';
+      main.setAttribute('aria-label', `Open ${item.name}, ${sizeLabel(item)}`);
+      main.addEventListener('click', () => goTo(item.path));
     }
-    const barWrap = el('div','sitem-bar-wrap');
-    const bar = el('div','sitem-bar');
+    const top = el('div', 'sitem-top');
+    const dot = el('div', 'sitem-dot'); dot.style.background = color;
+    const name = el('div', 'sitem-name', item.name); name.title = item.path;
+    top.append(dot, name, el('div', 'sitem-size', sizeLabel(item)));
+    const barWrap = el('div', 'sitem-bar-wrap');
+    const bar = el('div', 'sitem-bar');
     bar.style.background = color;
     bar.style.width = Math.max(1,((item.size||0)/maxSz)*100)+'%';
     barWrap.appendChild(bar);
-    div.append(top, barWrap);
+    main.append(top, barWrap);
+    div.appendChild(main);
 
-    if (item.isDir!==false) {
-      div.addEventListener('click', e => {
-        if (e.target.classList.contains('sitem-refresh-btn')) return;
-        goTo(item.path);
-      });
-      const refreshBtn = div.querySelector('.sitem-refresh-btn');
-      if (refreshBtn) refreshBtn.addEventListener('click', e => { e.stopPropagation(); refreshPath(item.path); });
+    if (isDir) {
+      const actions = el('div', 'sitem-actions');
+      const btn = el('button', 'sitem-refresh-btn', '↺');
+      btn.type = 'button';
+      btn.dataset.path = item.path;
+      btn.setAttribute('aria-label', `Refresh ${item.name}`);
+      btn.title = 'Refresh this folder';
+      if (refreshingPaths.has(item.path)) { btn.classList.add('spinning'); btn.setAttribute('aria-busy', 'true'); }
+      btn.addEventListener('click', e => { e.stopPropagation(); refreshPath(item.path); });
+      actions.appendChild(btn);
+      div.appendChild(actions);
     }
     list.appendChild(div);
   });
@@ -1131,15 +1295,19 @@ function renderSidebar(data) {
     const note = document.createElement('div');
     note.className = 'sitem file';
     note.style.animation = 'none';
-    note.innerHTML = '<div class="sitem-top"><div class="sitem-name"></div><div class="sitem-size"></div></div>';
-    note.querySelector('.sitem-name').textContent = `+ ${hidden.length} smaller items not shown`;
-    note.querySelector('.sitem-size').textContent = fmt(hidden.reduce((s,c) => s+(c.size||0), 0));
+    const main = el('div', 'sitem-main');
+    const top = el('div', 'sitem-top');
+    top.append(el('div', 'sitem-name', `+ ${hidden.length} smaller items not shown`),
+               el('div', 'sitem-size', fmt(sumSizes(hidden))));
+    main.appendChild(top);
+    note.appendChild(main);
     list.appendChild(note);
   }
 }
 
 // ── Init ─────────────────────────────────────────────────────
 document.getElementById('back-btn').addEventListener('click', goBack);
+document.getElementById('up-btn').addEventListener('click', goUp);
 document.getElementById('refresh-btn').addEventListener('click', () => refreshCurrent(true));
 document.getElementById('path-form').addEventListener('submit', e => { e.preventDefault(); goToPath(); });
 window.addEventListener('resize', () => {
@@ -1147,8 +1315,11 @@ window.addEventListener('resize', () => {
   resizeTimer = setTimeout(() => { if (currentData) renderTreemap(currentData); }, 150);
 });
 window.addEventListener('keydown', e => {
-  if (document.activeElement === document.getElementById('path-input')) return;
-  if (e.key==='Backspace'||e.key==='ArrowLeft') goBack();
+  // Never hijack browser/OS shortcuts (Cmd/Ctrl/Alt/Shift+Arrow etc.) or typing in form fields
+  if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  const t = e.target;
+  if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+  if (e.key==='Backspace'||e.key==='ArrowLeft') { e.preventDefault(); goBack(); }
 });
 
 d3Available();

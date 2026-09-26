@@ -511,7 +511,10 @@ class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
         self.assertEqual(types[-1], 'done')
         self.assertFalse(events[0]['from_cache'])
         self.assertEqual(events[0]['path'], self.root)
-        self.assertEqual(events[0]['total_dirs'], 3)
+        # total_dirs counts every child event, including the "(loose files)" entry,
+        # so the client's progress bar reaches exactly 100%.
+        self.assertEqual(events[0]['total_dirs'], 4)
+        self.assertEqual(events[0]['total_dirs'], sum(1 for e in events if e['type'] == 'child'))
         names = {e['name'] for e in events if e['type'] == 'child'}
         self.assertEqual(names, {'big', 'small', 'empty', '(loose files)'})
 
