@@ -575,6 +575,21 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
         self.assertTrue(disko._sound_child(
             {'name': 'x', 'path': '/x', 'size': None, 'isDir': True, 'mount': True}))
 
+    def test_unhashable_file_type_and_status_rejected_not_crashed(self):
+        # 'fileType' and 'status' are checked against known values with 'in' on a
+        # dict/frozenset, which raises TypeError for an unhashable value (a JSON array
+        # or object) rather than returning False -- cache_load() accepts these
+        # JSON-native shapes, so a malformed cache entry with e.g. fileType: [] must
+        # be rejected cleanly, not crash the validator meant to turn it into a miss.
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': False, 'fileType': []}))
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': False, 'fileType': {}}))
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': True, 'status': []}))
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': True, 'status': {}}))
+
     def test_non_finite_value_under_unknown_key_rejected(self):
         # _json_safe is a general backstop: a non-finite float under a field this
         # validator's author never anticipated (not just size/status/mount) must still

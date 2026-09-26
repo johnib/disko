@@ -163,8 +163,9 @@ def _sound_child(c) -> bool:
             and isinstance(c.get('path'), str)
             and isinstance(c.get('isDir'), bool)
             and (size is None or (_finite_number(size) and size >= 0))
-            and (file_type is None or file_type in FILE_TYPE_EXTENSIONS or file_type == 'other')
-            and (status is None or status in _KNOWN_CHILD_STATUSES)
+            and (file_type is None
+                 or (isinstance(file_type, str) and (file_type in FILE_TYPE_EXTENSIONS or file_type == 'other')))
+            and (status is None or (isinstance(status, str) and status in _KNOWN_CHILD_STATUSES))
             and (mount is None or isinstance(mount, bool))
             and all(_json_safe(v) for v in c.values()))
 
