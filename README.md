@@ -72,7 +72,7 @@ python3 disko.py --path /data --no-browser
 
 ## How It Works
 
-1. **Scanning** — disko lists the immediate children of the current folder. Each subfolder is sized by running `du -sk -x` (staying on one filesystem) in a `concurrent.futures.ThreadPoolExecutor` with 12 workers per scan. Loose files directly in the folder are summed with `stat` and shown as a single "(loose files)" tile.
+1. **Scanning** — disko lists the immediate children of the current folder. Each subfolder is sized by running `du -sk` (staying on one filesystem) in a `concurrent.futures.ThreadPoolExecutor` with 12 workers per scan. Loose files directly in the folder are summed with `stat` and shown as a single "(loose files)" tile.
 2. **Streaming** — as each subfolder is sized, the result is pushed to the browser over an SSE (`text/event-stream`) connection so the treemap updates in real time.
 3. **Visualization** — the browser renders an interactive, zoomable treemap using [D3.js](https://d3js.org/). Node area is proportional to disk usage.
 4. **Prefetch** — after a scan, the 10 largest subfolders are scanned in the background by a shared pool of 4 prefetch workers (and so on recursively), so drilling down is usually instant.
