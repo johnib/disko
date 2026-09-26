@@ -93,7 +93,7 @@ The cache stores one entry per scanned folder (including prefetched folders). En
 
 ## Contributing
 
-Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to open issues, submit pull requests, and manually test your changes.
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to open issues, submit pull requests, run the unit tests, and manually test your changes.
 
 ---
 

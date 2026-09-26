@@ -32,6 +32,14 @@ Thank you for your interest in contributing to disko!
 - No build tools, transpilers, or bundlers. The JS is served directly by the embedded HTTP server.
 - Keep functions small and well-named; add a brief comment for any non-obvious logic.
 
+## Unit tests
+
+Run the standard-library unit test suite from the repository root:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## Manual testing checklist
 
 Before submitting a pull request, verify the following scenarios work correctly:
@@ -51,7 +59,7 @@ Before submitting a pull request, verify the following scenarios work correctly:
 
 - Keep pull requests focused on a single change or feature.
 - Reference any related issue in the PR description (e.g. `Closes #42`).
-- Make sure all items in the manual testing checklist above pass.
+- Make sure the unit tests and all items in the manual testing checklist above pass.
 - Write a clear description of what changed and why.
 - Be responsive to review feedback; mark conversations resolved after addressing them.
 
