@@ -9,6 +9,7 @@ import argparse
 import concurrent.futures
 import errno
 import json
+import math
 import os
 import platform
 import signal
@@ -98,13 +99,21 @@ def _cache_key(path: str) -> str:
 
 
 def _sound_entry(entry) -> bool:
-    """True if entry is a well-formed cache dict (has the keys every reader relies on).
+    """True if entry is a well-formed cache dict (has the keys/types every reader relies on).
 
     Guards every raw _cache[...]/_cache.get(...) read (cache_get, cache_set's staleness
     check, _propagate_size's ancestor read) against a malformed/foreign value ending up
     in _cache -- cache_load only validates that the top-level JSON is a dict, never each
-    per-path value, so a hand-edited or corrupted cache file can put anything at a key."""
-    return isinstance(entry, dict) and 'children' in entry and 'scanned_at' in entry
+    per-path value, so a hand-edited or corrupted cache file can put anything at a key,
+    including a dict with the right keys but wrong-typed values (e.g. scanned_at: null,
+    which would otherwise raise TypeError when compared to a float)."""
+    if not isinstance(entry, dict):
+        return False
+    children = entry.get('children')
+    scanned_at = entry.get('scanned_at')
+    return (isinstance(children, list) and all(isinstance(c, dict) for c in children)
+            and isinstance(scanned_at, (int, float)) and not isinstance(scanned_at, bool)
+            and math.isfinite(scanned_at))
 
 
 def cache_get(path: str):
@@ -1224,6 +1233,7 @@ function navigate(path, force, onCommit) {
         renderData({ path: meta.path, name: meta.name, size: sumSizes(items), children: items.slice() });
       }
       if (currentData) { currentData.done = true; updateEmptyState(currentData); }
+      reconcileActiveFilter(currentData ? currentData.children : items);
       setProgress(100);
       setScanStatus('done ✓', true);
       setTimeout(() => { if (gen === navGen) { setProgress(-1); setScanStatus('', true); } }, 1500);
@@ -1700,6 +1710,20 @@ function announceFilter() {
 // the active entry again (or Escape) clears it.
 function toggleFilter(bucket) {
   activeFilterType = (activeFilterType === bucket) ? null : bucket;
+  announceFilter();
+  if (currentData) { renderTreemap(currentData); renderSidebar(currentData); renderLegend(currentData); }
+}
+
+// Called once a same-folder refresh/revalidation FULLY completes (not mid-stream, so a
+// bucket that simply hasn't arrived yet isn't mistaken for one that's gone). If the
+// active filter's type is no longer present in the final list (e.g. its last loose file
+// of that type was deleted/moved externally before the refresh), clear it -- otherwise
+// every cell/row would stay dimmed with no pressed legend entry to explain why, and no
+// legend at all if no buckets remain.
+function reconcileActiveFilter(children) {
+  if (!activeFilterType) return;
+  if ((children || []).some(c => c.fileType === activeFilterType)) return;
+  activeFilterType = null;
   announceFilter();
   if (currentData) { renderTreemap(currentData); renderSidebar(currentData); renderLegend(currentData); }
 }

@@ -392,6 +392,26 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
             }
         self.assertIsNone(disko.cache_get(self.root))
 
+    def test_wrong_typed_present_keys_treated_as_miss(self):
+        # A dict entry that has the right keys AND the current version, but wrong-typed
+        # values, must still be rejected -- not just a missing-key/non-dict-entry check.
+        # A null scanned_at would otherwise crash cache_set's `existing.get('scanned_at',
+        # 0) > scanned_at` comparison (None > float raises TypeError in Python 3).
+        key = disko._cache_key(self.root)
+        cases = [
+            {'children': 'not-a-list', 'scanned_at': time.time(), 'version': disko.CACHE_VERSION},
+            {'children': [1, 2, 3], 'scanned_at': time.time(), 'version': disko.CACHE_VERSION},
+            {'children': [], 'scanned_at': None, 'version': disko.CACHE_VERSION},
+            {'children': [], 'scanned_at': float('nan'), 'version': disko.CACHE_VERSION},
+            {'children': [], 'scanned_at': 'not-a-number', 'version': disko.CACHE_VERSION},
+        ]
+        for entry in cases:
+            with disko._cache_lock:
+                disko._cache[key] = entry
+            self.assertIsNone(disko.cache_get(self.root), entry)
+            # cache_set must not crash reading this entry's raw staleness check either.
+            self.assertTrue(disko.cache_set(self.root, []), entry)
+
     def test_non_dict_cache_entry_treated_as_miss(self):
         # A genuinely non-dict, non-None, truthy value: None alone would already be
         # caught by cache_get's earlier "not a sound entry" check without ever
