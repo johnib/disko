@@ -162,8 +162,15 @@ def _sound_child(c) -> bool:
     _size_key's sort and _propagate_size's own size-summing negate/add every child's
     'size' -- TypeError on a non-numeric value, and a silently wrong (NaN/inf-poisoned,
     or negative -- no allocated size the app itself produces is ever negative) ancestor
-    total otherwise. 'size' is None for a du failure/timeout in the real app, never any
-    other non-number. Any key outside _KNOWN_CHILD_KEYS is rejected outright --
+    total otherwise. 'size' is variant-specific rather than just "non-negative or
+    None": _mount_child always writes exactly 0 (mounts are never du'ed, so a stored
+    mount with a positive size would wrongly inflate the treemap/legend/folder
+    total), _iter_children only ever emits a bucket when its total is positive (never
+    None or 0, so a stored bucket with either would vanish from the UI instead of
+    being repaired), and _cacheable() requires every child's size to be non-None
+    before a scan is cached at all (so a stored ordinary-directory child's size is
+    always present, even though a live, not-yet-cached du failure/timeout legitimately
+    has size: None). Any key outside _KNOWN_CHILD_KEYS is rejected outright --
     write_event() spreads a cached child straight into the SSE event and
     renderTreemap() feeds it straight to d3.hierarchy(), so an extra key isn't just
     inert: it can collide with a protocol field (as 'type' did) or a D3-meaningful one
@@ -179,7 +186,7 @@ def _sound_child(c) -> bool:
             and isinstance(c.get('isDir'), bool)):
         return False
     size = c.get('size')
-    if not (size is None or (_finite_number(size) and size >= 0)):
+    if size is not None and not (_finite_number(size) and size >= 0):
         return False
     if not all(_json_safe(v) for v in c.values()):
         return False
@@ -187,14 +194,18 @@ def _sound_child(c) -> bool:
     status = c.get('status')
     mount = c.get('mount')
     if not c['isDir']:
-        # Bucket child: fileType is required (not optional) and never status/mount.
-        return (mount is None and status is None
+        # Bucket child: fileType is required (not optional) and never status/mount;
+        # size is always present and positive (see docstring).
+        return (mount is None and status is None and size is not None and size > 0
                 and isinstance(file_type, str) and (file_type in FILE_TYPE_EXTENSIONS or file_type == 'other'))
     if mount is not None:
-        # Mount point: mount is always exactly True, never paired with fileType/status.
-        return mount is True and file_type is None and status is None
-    # Ordinary du'ed directory: never fileType; status is optional and constrained.
-    return file_type is None and (status is None or (isinstance(status, str) and status in _KNOWN_CHILD_STATUSES))
+        # Mount point: mount is always exactly True, never paired with fileType/
+        # status, and size is always exactly 0.
+        return mount is True and file_type is None and status is None and size == 0
+    # Ordinary du'ed directory: never fileType; status is optional and constrained;
+    # a stored (cached) child's size is always present, never None.
+    return (file_type is None and size is not None
+            and (status is None or (isinstance(status, str) and status in _KNOWN_CHILD_STATUSES)))
 
 
 def _sound_entry(entry) -> bool:

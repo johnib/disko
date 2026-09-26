@@ -573,7 +573,7 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
         self.assertFalse(disko._sound_child(
             {'name': 'x', 'path': '/x', 'size': None, 'isDir': True, 'mount': 'yes'}))
         self.assertTrue(disko._sound_child(
-            {'name': 'x', 'path': '/x', 'size': None, 'isDir': True, 'mount': True}))
+            {'name': 'x', 'path': '/x', 'size': 0, 'isDir': True, 'mount': True}))
 
     def test_unhashable_file_type_and_status_rejected_not_crashed(self):
         # 'fileType' and 'status' are checked against known values with 'in' on a
@@ -609,6 +609,45 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
             {'name': 'x', 'path': '/x', 'size': 0, 'isDir': True, 'mount': True, 'fileType': 'image'}))
         self.assertFalse(disko._sound_child(
             {'name': 'x', 'path': '/x', 'size': 0, 'isDir': True, 'mount': True, 'status': 'partial'}))
+
+    def test_impossible_size_variants_rejected(self):
+        # 'size' is variant-specific, not just "non-negative or None": _mount_child
+        # always writes exactly 0 (a stored mount with a positive size would wrongly
+        # inflate the treemap/legend/folder total, since mounts are never du'ed);
+        # _iter_children only ever emits a bucket with a positive total (never None
+        # or 0, which would silently vanish the bucket from the UI instead of being
+        # repaired); and _cacheable() requires every child's size to be non-None
+        # before a scan is cached, so a stored ordinary-directory child's size is
+        # always present.
+        self.assertFalse(disko._sound_child(
+            {'name': 'mnt', 'path': '/mnt', 'size': 1000000000000, 'isDir': True, 'mount': True}))
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': None, 'isDir': False, 'fileType': 'image'}))
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 0, 'isDir': False, 'fileType': 'image'}))
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': None, 'isDir': True}))
+        # The corresponding valid shapes must still be accepted.
+        self.assertTrue(disko._sound_child(
+            {'name': 'mnt', 'path': '/mnt', 'size': 0, 'isDir': True, 'mount': True}))
+        self.assertTrue(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': False, 'fileType': 'image'}))
+        self.assertTrue(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 0, 'isDir': True}))
+
+    def test_cached_impossible_size_variant_is_a_full_cache_miss(self):
+        # End-to-end companion to test_impossible_size_variants_rejected: a stored
+        # entry with a corrupt variant-specific size must be a full cache miss.
+        mnt = os.path.join(self.root, 'mnt')
+        self.assertTrue(disko.cache_set(self.root, [
+            {'name': 'mnt', 'path': mnt, 'size': 1000000000000, 'isDir': True, 'mount': True},
+        ], scanned_at=time.time()))
+        self.assertIsNone(disko.cache_get(self.root))
+
+        self.assertTrue(disko.cache_set(self.root, [
+            {'name': 'x', 'path': os.path.join(self.root, 'x'), 'size': 0, 'isDir': False, 'fileType': 'image'},
+        ], scanned_at=time.time()))
+        self.assertIsNone(disko.cache_get(self.root))
 
     def test_cached_impossible_combination_is_a_full_cache_miss(self):
         # End-to-end: a typed directory or an untyped bucket child in a stored cache
