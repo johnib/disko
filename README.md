@@ -83,7 +83,7 @@ python3 disko.py --path /data --no-browser
 
 | Detail | Value |
 |---|---|
-| Location | `~/.disko_cache.json` |
+| Location | `~/.disko_cache.json` (override with the `DISKO_CACHE` environment variable) |
 | Version control | git-ignored by default |
 | Clear cache | `rm ~/.disko_cache.json` |
 

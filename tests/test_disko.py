@@ -204,10 +204,10 @@ class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
         disko._default_path = self._orig_default
         super(TestHTTPSmoke, self).tearDown()
 
-    def _get(self, path):
+    def _get(self, path, headers=None):
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
         try:
-            conn.request('GET', path)
+            conn.request('GET', path, headers=headers or {})
             resp = conn.getresponse()
             return resp.status, resp.getheader('Content-Type', ''), resp.read()
         finally:
@@ -261,6 +261,32 @@ class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
     def test_unknown_path_404(self):
         status, _, _ = self._get('/nope')
         self.assertEqual(status, 404)
+
+    def test_foreign_host_rejected(self):
+        # DNS-rebinding protection: only loopback Host headers are served.
+        status, _, _ = self._get('/', headers={'Host': 'evil.example:%d' % self.port})
+        self.assertEqual(status, 403)
+        status, _, _ = self._get('/', headers={'Host': 'localhost:%d' % self.port})
+        self.assertEqual(status, 200)
+
+    def test_cross_origin_rejected(self):
+        status, _, body = self._get('/stream?path=/', headers={'Origin': 'http://evil.example'})
+        self.assertEqual(status, 403)
+        self.assertNotIn(b'data: ', body)
+        status, _, _ = self._get('/', headers={'Sec-Fetch-Site': 'cross-site'})
+        self.assertEqual(status, 403)
+        status, _, _ = self._get('/', headers={'Origin': 'http://127.0.0.1:%d' % self.port})
+        self.assertEqual(status, 200)
+
+    def test_no_wildcard_cors(self):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
+        try:
+            conn.request('GET', '/')
+            resp = conn.getresponse()
+            resp.read()
+            self.assertIsNone(resp.getheader('Access-Control-Allow-Origin'))
+        finally:
+            conn.close()
 
 
 if __name__ == '__main__':
