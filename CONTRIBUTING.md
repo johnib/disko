@@ -36,15 +36,15 @@ Thank you for your interest in contributing to disko!
 
 Before submitting a pull request, verify the following scenarios work correctly:
 
-- [ ] **Startup** — `python disko.py /some/path` launches without errors and opens (or prints) the URL.
+- [ ] **Startup** — `python disko.py --path /some/path` launches without errors and opens the browser (or, with `--no-browser`, prints the URL).
 - [ ] **Treemap render** — The D3.js treemap displays folders sized proportionally to their disk usage.
 - [ ] **Drill-down** — Clicking a folder zooms into it and updates the breadcrumb trail.
 - [ ] **Cache badge on revisit** — Navigating back to a previously scanned folder shows the cache badge and the cached size/time.
 - [ ] **Refresh button** — Clicking the per-folder refresh button re-scans that folder and updates the display.
-- [ ] **Global refresh** — The global refresh control re-scans the root and clears stale cache entries.
+- [ ] **Header refresh** — The header ↺ Refresh button re-scans the current folder and updates the display.
 - [ ] **Path jump** — Typing a path into the path jump bar and submitting navigates directly to that folder.
 - [ ] **Progress indicator** — A progress indicator is visible during long scans.
-- [ ] **CLI flags** — Test at least two CLI flags (e.g. `--port`, `--no-open`) and confirm they behave as documented.
+- [ ] **CLI flags** — Test at least two CLI flags (e.g. `--port`, `--path`, `--no-browser`) and confirm they behave as documented.
 - [ ] **py_compile** — Run `python -m py_compile disko.py` and confirm it exits with no errors.
 
 ## Submitting PRs

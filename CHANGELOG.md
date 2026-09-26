@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Default path** — when `--path` is omitted, disko now starts in your home directory (`~`) on every platform. Previously macOS defaulted to `/System/Volumes/Data`, a slow whole-volume scan.
+
 ## [1.0.0] - 2026-06-28
 
 ### Added
@@ -19,9 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breadcrumbs** — clickable breadcrumb trail reflecting the current drill-down path.
 - **Path jump bar** — type any absolute path to navigate to it directly.
 - **Per-folder refresh** — refresh button on each folder to re-scan only that subtree.
-- **Global refresh** — top-level control to re-scan the root and invalidate stale cache entries.
 - **Progress indicator** — live progress display during active scans.
 - **Cache badge** — visual indicator on cached folders showing size and scan timestamp.
 - **Cross-platform support** — tested on macOS and Linux.
-- **CLI flags** — configurable port, auto-open behavior, root path, and other options via command-line arguments.
+- **CLI flags** — configurable port (`--port`), starting path (`--path`) and browser auto-open (`--no-browser`).
 - **Zero dependencies** — runs entirely on the Python standard library with no third-party packages required.

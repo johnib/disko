@@ -7,9 +7,6 @@ dist/
 build/
 *.egg-info/
 
-# personal cache, do not commit
-.disko_cache.json
-
 # OS
 .DS_Store
 Thumbs.db
