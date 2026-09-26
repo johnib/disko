@@ -22,7 +22,7 @@ _default_path = "/"
 
 SCAN_WORKERS = 12   # parallel du workers per scan
 PREFETCH_WORKERS = 4  # background prefetch workers
-CACHE_FILE = os.path.expanduser('~/.disko_cache.json')
+CACHE_FILE = os.path.expanduser(os.environ.get('DISKO_CACHE') or '~/.disko_cache.json')
 PREFETCH_TOP_N = 10  # prefetch top-N largest subdirs after each scan
 
 # ── Cache ────────────────────────────────────────────────────────────────────

@@ -31,5 +31,8 @@ jobs:
       - name: Lint
         run: flake8 . --max-line-length=120 --exclude=.git
 
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
       - name: Install package and smoke test
         run: pip install . && disko --help
