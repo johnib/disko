@@ -593,6 +593,14 @@ function renderFull(data) {
   document.getElementById('back-btn').classList.toggle('visible', navStack.length > 0);
 }
 
+// Build an element with textContent only (never innerHTML) so untrusted names can't inject markup.
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
 function renderBreadcrumb() {
   const bc = document.getElementById('breadcrumb');
   bc.innerHTML = '';
@@ -681,12 +689,13 @@ function renderTreemap(data) {
       tooltip.style.display='block';
       tooltip.style.left=Math.min(ev.clientX+14,window.innerWidth-320)+'px';
       tooltip.style.top=Math.max(10,ev.clientY-10)+'px';
-      tooltip.innerHTML=`
-        <div class="tt-name">${d.data.name}</div>
-        <div class="tt-path">${d.data.path}</div>
-        <div class="tt-size">${fmt(d.data.size||d.value)}</div>
-        <div class="tt-pct">${pctOf(d.data.size||d.value,totalVal)} of this view</div>
-        ${d.data.isDir!==false?'<div class="tt-hint">Click to drill down →</div>':''}`;
+      tooltip.textContent = '';
+      tooltip.append(
+        el('div','tt-name',d.data.name),
+        el('div','tt-path',d.data.path),
+        el('div','tt-size',fmt(d.data.size||d.value)),
+        el('div','tt-pct',pctOf(d.data.size||d.value,totalVal)+' of this view'));
+      if (d.data.isDir!==false) tooltip.appendChild(el('div','tt-hint','Click to drill down →'));
     })
     .on('mouseleave',()=>{ tooltip.style.display='none'; })
     .on('click',(_,d)=>{ if(d.data.isDir===false)return; tooltip.style.display='none'; goTo(d.data.path); });
@@ -706,21 +715,22 @@ function renderSidebar(data) {
     div.className = 'sitem'+(item.isDir===false?' file':'');
     div.style.animationDelay = Math.min(i*20,200)+'ms';
 
-    const actionsHtml = item.isDir!==false ? `
-      <div class="sitem-actions">
-        <button class="sitem-refresh-btn" title="Refresh this folder">↺</button>
-      </div>` : '';
-
-    div.innerHTML = `
-      <div class="sitem-top">
-        <div class="sitem-dot" style="background:${color}"></div>
-        <div class="sitem-name" title="${item.path}">${item.name}</div>
-        <div class="sitem-size">${fmt(item.size)}</div>
-        ${actionsHtml}
-      </div>
-      <div class="sitem-bar-wrap">
-        <div class="sitem-bar" style="background:${color};width:${Math.max(1,(item.size/maxSz)*100)}%"></div>
-      </div>`;
+    const top = el('div','sitem-top');
+    const dot = el('div','sitem-dot'); dot.style.background = color;
+    const name = el('div','sitem-name',item.name); name.title = item.path;
+    top.append(dot, name, el('div','sitem-size',fmt(item.size)));
+    if (item.isDir!==false) {
+      const actions = el('div','sitem-actions');
+      const btn = el('button','sitem-refresh-btn','↺'); btn.title = 'Refresh this folder';
+      actions.appendChild(btn);
+      top.appendChild(actions);
+    }
+    const barWrap = el('div','sitem-bar-wrap');
+    const bar = el('div','sitem-bar');
+    bar.style.background = color;
+    bar.style.width = Math.max(1,(item.size/maxSz)*100)+'%';
+    barWrap.appendChild(bar);
+    div.append(top, barWrap);
 
     if (item.isDir!==false) {
       div.addEventListener('click', e => {
@@ -744,7 +754,7 @@ window.addEventListener('keydown', e => {
   if (e.key==='Backspace'||e.key==='ArrowLeft') goBack();
 });
 
-navigate("%%DEFAULT_PATH%%", false);
+navigate(%%DEFAULT_PATH%%, false);
 </script>
 </body>
 </html>
@@ -758,7 +768,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == '/':
-            body = HTML.replace("%%DEFAULT_PATH%%", _default_path).encode("utf-8")
+            body = HTML.replace("%%DEFAULT_PATH%%", json.dumps(_default_path).replace("</", "<\\/")).encode("utf-8")
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(body)))
