@@ -456,6 +456,8 @@ const PALETTE = [
 let navStack = [];
 let currentData = null;
 let activeES = null;
+let navGen = 0;       // bumped on every navigation; stale stream callbacks bail out
+let lastPath = null;  // last requested path, so Refresh can retry a failed first load
 
 function fmt(b) {
   if (!b || b <= 0) return '0 B';
@@ -473,23 +475,40 @@ function timeAgo(ts) {
 }
 
 // ── Streaming ────────────────────────────────────────────────
-function startStream(path, force, callbacks) {
+function startStream(path, force, gen, callbacks) {
   if (activeES) { activeES.close(); activeES = null; }
   const url = `${API}/stream?path=${encodeURIComponent(path)}${force?'&force=1':''}`;
   const es = new EventSource(url);
   activeES = es;
   es.onmessage = e => {
+    if (gen !== navGen) { es.close(); return; }
     const msg = JSON.parse(e.data);
     if (msg.type === 'start') callbacks.onStart?.(msg);
     if (msg.type === 'child') callbacks.onChild?.(msg);
     if (msg.type === 'done')  { es.close(); activeES=null; callbacks.onDone?.(); }
     if (msg.type === 'error') { es.close(); activeES=null; callbacks.onError?.(msg.error); }
   };
-  es.onerror = () => { es.close(); activeES=null; callbacks.onError?.('Connection lost'); };
+  es.onerror = () => {
+    if (gen !== navGen) { es.close(); return; }
+    es.close(); activeES=null; callbacks.onError?.('Connection lost');
+  };
+}
+
+// Abort any in-flight scan and reset the scan UI (used by Back / breadcrumb).
+function cancelStream() {
+  navGen++;
+  if (activeES) { activeES.close(); activeES = null; }
+  hideCacheBadge();
+  setProgress(-1);
+  setScanStatus('', true);
+  document.getElementById('refresh-btn').classList.remove('spinning');
 }
 
 // ── Navigation ───────────────────────────────────────────────
-function navigate(path, force) {
+// onCommit runs in onStart, i.e. only once the server has accepted the path.
+function navigate(path, force, onCommit) {
+  const gen = ++navGen;
+  lastPath = path;
   document.getElementById('error-overlay').classList.remove('show');
   hideCacheBadge();
   setProgress(0);
@@ -498,8 +517,9 @@ function navigate(path, force) {
   const items = [];
   let meta = null, totalDirs = 0, received = 0;
 
-  startStream(path, force, {
+  startStream(path, force, gen, {
     onStart(msg) {
+      if (onCommit) onCommit();
       meta = msg; totalDirs = msg.total_dirs;
       if (msg.from_cache) showCacheBadge(msg.scanned_at);
       render({ path: msg.path, name: msg.name, size: 0, children: [] });
@@ -518,7 +538,7 @@ function navigate(path, force) {
     onDone() {
       setProgress(100);
       setScanStatus('done ✓', true);
-      setTimeout(() => { setProgress(-1); setScanStatus('', true); }, 1500);
+      setTimeout(() => { if (gen === navGen) { setProgress(-1); setScanStatus('', true); } }, 1500);
       document.getElementById('refresh-btn').classList.remove('spinning');
     },
     onError(err) {
@@ -531,16 +551,14 @@ function navigate(path, force) {
 }
 
 function goTo(path, force) {
-  if (currentData) navStack.push(currentData);
-  currentData = null;
-  navigate(path, force);
+  const prev = currentData;
+  navigate(path, force, () => { if (prev) navStack.push(prev); });
 }
 
 function refreshCurrent(force=true) {
-  if (!currentData) return;
+  const path = currentData ? currentData.path : lastPath;
+  if (!path) return;
   document.getElementById('refresh-btn').classList.add('spinning');
-  const path = currentData.path;
-  currentData = null;
   navigate(path, force);
 }
 
@@ -553,6 +571,7 @@ function refreshPath(path) {
 
 function goBack() {
   if (!navStack.length) return;
+  cancelStream();
   const prev = navStack.pop();
   currentData = prev;
   renderFull(prev);
@@ -561,16 +580,17 @@ function goBack() {
 function goToPath() {
   const val = document.getElementById('path-input').value.trim();
   if (!val) return false;
-  navStack = [];
-  currentData = null;
-  document.getElementById('path-input').value = '';
   document.getElementById('path-input').blur();
-  navigate(val, false);
+  navigate(val, false, () => {
+    navStack = [];
+    document.getElementById('path-input').value = '';
+  });
   return false;
 }
 
 // ── Render ───────────────────────────────────────────────────
 function render(data) {
+  document.getElementById('error-overlay').classList.remove('show');
   currentData = data;
   renderBreadcrumb();
   renderTreemap(data);
@@ -603,7 +623,7 @@ function renderBreadcrumb() {
     span.className = 'crumb' + (i === chain.length-1 ? ' active' : '');
     span.title = item.path;
     span.textContent = name;
-    if (i < chain.length-1) span.onclick = () => { navStack = navStack.slice(0,i); renderFull(item); };
+    if (i < chain.length-1) span.onclick = () => { cancelStream(); navStack = navStack.slice(0,i); renderFull(item); };
     bc.appendChild(span);
     if (i < chain.length-1) {
       const sep = document.createElement('span'); sep.className='crumb-sep'; sep.textContent=' › ';
