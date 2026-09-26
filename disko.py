@@ -2,7 +2,7 @@
 """
 disko -- interactive disk usage explorer
 Runs a local web server with a real-time D3.js treemap of your filesystem.
-Usage: python3 disko.py [--port PORT] [--path PATH] [--no-browser] [--verbose]
+Usage: python3 disko.py [--port PORT] [--path PATH] [--no-browser] [--du-timeout SECS] [--verbose]
 """
 
 import argparse

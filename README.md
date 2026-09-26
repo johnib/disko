@@ -57,6 +57,7 @@ python3 disko.py [OPTIONS]
 | `--path PATH` | `~` (your home directory) | Starting directory to explore |
 | `--no-browser` | — | Start the server without opening a browser tab |
 | `--du-timeout SECONDS` | `300` | Give up on a single folder's `du` after this many seconds (must be positive); the folder is then shown as "timed out" |
+| `--verbose` | — | Log each HTTP request to stderr (quiet by default) |
 | `--help` | — | Show help and exit |
 
 **Examples:**
