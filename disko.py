@@ -24,6 +24,7 @@ SCAN_WORKERS = 12   # parallel du workers per scan
 PREFETCH_WORKERS = 4  # background prefetch workers
 CACHE_FILE = os.path.expanduser('~/.disko_cache.json')
 PREFETCH_TOP_N = 10  # prefetch top-N largest subdirs after each scan
+DU_TIMEOUT = 300     # seconds per du call (overridable via --du-timeout)
 
 # ── Cache ────────────────────────────────────────────────────────────────────
 
@@ -72,52 +73,68 @@ def cache_delete(path: str):
 
 # ── Scanning ─────────────────────────────────────────────────────────────────
 
-def du_single(path: str) -> int:
+def norm_path(path: str) -> str:
+    """Absolute, user-expanded, normalized path (never starts with '-')."""
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def du_single(path: str):
+    """Return (size_bytes_or_None, status).
+
+    status is None on success, 'partial' when du exited non-zero but still
+    reported a total (e.g. unreadable subdirs), 'timeout', or an error string
+    when no size could be determined (size is then None).
+    """
     try:
-        if platform.system() == "Darwin":
-            cmd = ["du", "-sk", "-x", path]
-        else:
-            cmd = ["du", "-sk", "--one-file-system", path]
-        r = subprocess.run(cmd,
-                           capture_output=True, text=True, timeout=30)
-        for line in r.stdout.strip().split('\n'):
-            if '\t' in line:
-                kb, _ = line.split('\t', 1)
-                return int(kb.strip()) * 1024
-    except Exception:
-        pass
-    return 0
+        r = subprocess.run(["du", "-sk", "-x", "--", path],
+                           capture_output=True, timeout=DU_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None, 'timeout'
+    except OSError as e:
+        return None, str(e) or 'du failed'
+    try:
+        kb = int(r.stdout.split(b'\t', 1)[0])
+    except ValueError:
+        err = r.stderr.decode('utf-8', 'replace').strip().splitlines()
+        return None, (err[0][:200] if err else 'du failed (exit %d)' % r.returncode)
+    return kb * 1024, ('partial' if r.returncode else None)
 
 
-def scan_to_list(path: str) -> list:
-    """Scan path and return list of child dicts."""
-    path = os.path.normpath(os.path.expanduser(path))
-    if not os.path.isdir(path):
-        return []
+def _dir_child(entry, result) -> dict:
+    size, status = result
+    child = {'name': entry.name, 'path': entry.path, 'size': size, 'isDir': True}
+    if status:
+        child['status'] = status
+    return child
+
+
+def _size_key(child) -> int:
+    return -(child.get('size') or 0)
+
+
+def _cacheable(children) -> bool:
+    """Scans with unknown-size children are not cached, so they get retried."""
+    return children is not None and all(c.get('size') is not None for c in children)
+
+
+def scan_to_list(path: str):
+    """Scan path and return list of child dicts, or None if it can't be read."""
+    path = norm_path(path)
     try:
         entries = list(os.scandir(path))
-    except PermissionError:
-        return []
+    except OSError:
+        return None
 
     dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
     files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
 
-    file_total = sum(
-        e.stat(follow_symlinks=False).st_size for e in files
-        if _safe_stat(e)
-    )
+    file_total = sum(_file_size(e) for e in files)
 
     children = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futures = {ex.submit(du_single, e.path): e for e in dirs}
         for fut in concurrent.futures.as_completed(futures):
-            entry = futures[fut]
-            children.append({
-                'name': entry.name,
-                'path': entry.path,
-                'size': fut.result(),
-                'isDir': True,
-            })
+            children.append(_dir_child(futures[fut], fut.result()))
 
     if file_total > 0:
         children.append({
@@ -127,16 +144,15 @@ def scan_to_list(path: str) -> list:
             'isDir': False,
         })
 
-    children.sort(key=lambda c: -c['size'])
+    children.sort(key=_size_key)
     return children
 
 
-def _safe_stat(entry):
+def _file_size(entry) -> int:
     try:
-        entry.stat(follow_symlinks=False)
-        return True
+        return entry.stat(follow_symlinks=False).st_size
     except OSError:
-        return False
+        return 0
 
 
 # ── Background prefetch pool ─────────────────────────────────────────────────
@@ -149,8 +165,8 @@ _prefetch_lock = threading.Lock()
 
 def schedule_prefetch(children: list):
     """Kick off background scans for the top-N largest child dirs."""
-    dirs = [c for c in children if c.get('isDir') and c['size'] > 0]
-    dirs = sorted(dirs, key=lambda c: -c['size'])[:PREFETCH_TOP_N]
+    dirs = [c for c in children if c.get('isDir') and (c.get('size') or 0) > 0]
+    dirs = sorted(dirs, key=_size_key)[:PREFETCH_TOP_N]
     for d in dirs:
         p = d['path']
         with _prefetch_lock:
@@ -163,7 +179,10 @@ def schedule_prefetch(children: list):
 def _do_prefetch(path: str):
     try:
         children = scan_to_list(path)
-        cache_set(path, children)
+        if children is None:
+            return
+        if _cacheable(children):
+            cache_set(path, children)
         # One more level deep
         schedule_prefetch(children)
     finally:
@@ -174,7 +193,7 @@ def _do_prefetch(path: str):
 # ── Streaming (SSE) ───────────────────────────────────────────────────────────
 
 def stream_directory(path: str, write_event, force: bool = False):
-    path = os.path.normpath(os.path.expanduser(path))
+    path = norm_path(path)
     if not os.path.isdir(path):
         write_event({'type': 'error', 'error': 'Not a directory or not found'})
         return
@@ -198,7 +217,10 @@ def stream_directory(path: str, write_event, force: bool = False):
         # Silent background refresh
         def refresh():
             new_children = scan_to_list(path)
-            cache_set(path, new_children)
+            if new_children is None:
+                return
+            if _cacheable(new_children):
+                cache_set(path, new_children)
             schedule_prefetch(new_children)
         threading.Thread(target=refresh, daemon=True).start()
         return
@@ -206,15 +228,13 @@ def stream_directory(path: str, write_event, force: bool = False):
     # Live scan
     try:
         entries = list(os.scandir(path))
-    except PermissionError as e:
+    except OSError as e:
         write_event({'type': 'error', 'error': str(e)})
         return
 
     dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
     files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
-    file_total = sum(
-        e.stat(follow_symlinks=False).st_size for e in files if _safe_stat(e)
-    )
+    file_total = sum(_file_size(e) for e in files)
 
     write_event({
         'type': 'start',
@@ -228,13 +248,7 @@ def stream_directory(path: str, write_event, force: bool = False):
     with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futures = {ex.submit(du_single, e.path): e for e in dirs}
         for fut in concurrent.futures.as_completed(futures):
-            entry = futures[fut]
-            child = {
-                'name': entry.name,
-                'path': entry.path,
-                'size': fut.result(),
-                'isDir': True,
-            }
+            child = _dir_child(futures[fut], fut.result())
             collected.append(child)
             write_event({'type': 'child', **child})
 
@@ -244,7 +258,8 @@ def stream_directory(path: str, write_event, force: bool = False):
         write_event({'type': 'child', **loose})
 
     write_event({'type': 'done'})
-    cache_set(path, sorted(collected, key=lambda c: -c['size']))
+    if _cacheable(collected):
+        cache_set(path, sorted(collected, key=_size_key))
     schedule_prefetch(collected)
 
 
@@ -322,6 +337,8 @@ body {
 .cell:hover rect { opacity: .8; stroke-width: 0; }
 .cell.file { cursor: default; }
 .cell text { pointer-events: none; }
+.cell.partial rect { stroke: #cbd5e1; stroke-dasharray: 4 3; }
+.cell.unknown rect { fill: #334155; stroke: #64748b; stroke-dasharray: 4 3; }
 
 /* ── Sidebar ── */
 #sidebar {
@@ -362,6 +379,7 @@ body {
 @keyframes fadeSlide { from{opacity:0;transform:translateX(8px)} to{opacity:1;transform:translateX(0)} }
 .sitem:hover { background: #1e2535; }
 .sitem.file { cursor: default; }
+.sitem.unknown .sitem-size { color: #f59e0b; font-style: italic; }
 .sitem-top { display: flex; align-items: center; gap: 7px; }
 .sitem-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .sitem-name { flex: 1; font-size: 12px; color: #cbd5e1;
@@ -464,6 +482,20 @@ function fmt(b) {
   const v = b / Math.pow(1024, i);
   return (i >= 2 ? v.toFixed(1) : Math.round(v)) + ' ' + u[i];
 }
+// Children whose du failed carry size:null plus a status ('timeout' or an
+// error); du totals that skipped unreadable subdirs carry status 'partial'.
+function isUnknown(c) { return c.size == null; }
+function hasSizeInfo(c) { return c.size > 0 || !!c.status; }
+function sizeLabel(c) {
+  if (isUnknown(c)) return c.status === 'timeout' ? 'timed out' : 'unknown';
+  return (c.status ? '≥ ' : '') + fmt(c.size);
+}
+function statusText(c) {
+  if (!c.status) return '';
+  if (c.status === 'partial') return 'Partial: some subfolders could not be read';
+  if (c.status === 'timeout') return 'Size unknown: du timed out';
+  return 'Size unknown: du failed';
+}
 function pctOf(a, b) { return b ? ((a/b)*100).toFixed(1)+'%' : '—'; }
 function timeAgo(ts) {
   const s = Math.round(Date.now()/1000 - ts);
@@ -508,9 +540,9 @@ function navigate(path, force) {
       received++;
       // Insert sorted by size
       let lo = 0, hi = items.length;
-      while (lo < hi) { const mid = (lo+hi)>>1; items[mid].size >= item.size ? lo=mid+1 : hi=mid; }
+      while (lo < hi) { const mid = (lo+hi)>>1; (items[mid].size||0) >= (item.size||0) ? lo=mid+1 : hi=mid; }
       items.splice(lo, 0, item);
-      const total = items.reduce((s,i) => s+i.size, 0);
+      const total = items.reduce((s,i) => s+(i.size||0), 0);
       renderData({ path: meta.path, name: meta.name, size: total, children: [...items] });
       if (totalDirs > 0) setProgress(Math.round((received/totalDirs)*100));
       setScanStatus(`${received} / ${totalDirs}`, false);
@@ -639,21 +671,25 @@ function renderTreemap(data) {
   const W = wrap.clientWidth-20, H = wrap.clientHeight-20;
   const svg = d3.select('#treemap').attr('width',W).attr('height',H);
   svg.selectAll('*').remove();
-  const children = (data.children||[]).filter(c=>c.size>0);
+  const children = (data.children||[]).filter(hasSizeInfo);
   if (!children.length) return;
+  // Unknown / zero-size partial entries get a small nominal area so they stay visible.
+  const knownTotal = children.reduce((s,c)=>s+(c.size||0),0);
+  const stubSize = Math.max(1, knownTotal*0.02);
 
   const root = d3.hierarchy({name:'root',children})
-    .sum(d=>d.size||0).sort((a,b)=>b.value-a.value);
+    .sum(d=>d.children?0:(d.size>0?d.size:stubSize)).sort((a,b)=>b.value-a.value);
   d3.treemap().size([W,H]).paddingOuter(3).paddingInner(2).round(true)(root);
 
   const topKids = root.children||[];
   const colorOf = d => { let n=d; while(n.depth>1) n=n.parent; return PALETTE[topKids.indexOf(n)%PALETTE.length]; };
   const shade = (hex,depth) => { const c=d3.color(hex); return c?c.darker(depth*.35).toString():hex; };
   const tooltip = document.getElementById('tooltip');
-  const totalVal = root.value||1;
+  const totalVal = knownTotal||1;
 
   const cell = svg.selectAll('g.cell').data(root.leaves()).enter()
-    .append('g').attr('class', d=>'cell'+(d.data.isDir===false?' file':''))
+    .append('g').attr('class', d=>'cell'+(d.data.isDir===false?' file':'')
+      +(isUnknown(d.data)?' unknown':(d.data.status?' partial':'')))
     .attr('transform', d=>`translate(${d.x0},${d.y0})`);
 
   cell.append('rect')
@@ -673,7 +709,7 @@ function renderTreemap(data) {
     }
     if (cw>55&&ch>38)
       g.append('text').attr('x',6).attr('y',30).attr('font-size',10)
-        .attr('fill','rgba(255,255,255,.5)').text(fmt(d.data.size||d.value));
+        .attr('fill','rgba(255,255,255,.5)').text(sizeLabel(d.data));
   });
 
   cell
@@ -684,8 +720,9 @@ function renderTreemap(data) {
       tooltip.innerHTML=`
         <div class="tt-name">${d.data.name}</div>
         <div class="tt-path">${d.data.path}</div>
-        <div class="tt-size">${fmt(d.data.size||d.value)}</div>
-        <div class="tt-pct">${pctOf(d.data.size||d.value,totalVal)} of this view</div>
+        <div class="tt-size">${sizeLabel(d.data)}</div>
+        <div class="tt-pct">${pctOf(d.data.size||0,totalVal)} of this view</div>
+        ${d.data.status?`<div class="tt-cached">${statusText(d.data)}</div>`:''}
         ${d.data.isDir!==false?'<div class="tt-hint">Click to drill down →</div>':''}`;
     })
     .on('mouseleave',()=>{ tooltip.style.display='none'; })
@@ -696,14 +733,15 @@ function renderTreemap(data) {
 function renderSidebar(data) {
   const list = document.getElementById('sidebar-list');
   list.innerHTML = '';
-  const items = (data.children||[]).filter(c=>c.size>0);
+  const items = (data.children||[]).filter(hasSizeInfo);
   if (!items.length) return;
   const maxSz = items[0].size||1;
 
   items.forEach((item,i) => {
     const color = PALETTE[i%PALETTE.length];
     const div = document.createElement('div');
-    div.className = 'sitem'+(item.isDir===false?' file':'');
+    div.className = 'sitem'+(item.isDir===false?' file':'')+(item.status?' unknown':'');
+    if (item.status) div.title = statusText(item);
     div.style.animationDelay = Math.min(i*20,200)+'ms';
 
     const actionsHtml = item.isDir!==false ? `
@@ -715,11 +753,11 @@ function renderSidebar(data) {
       <div class="sitem-top">
         <div class="sitem-dot" style="background:${color}"></div>
         <div class="sitem-name" title="${item.path}">${item.name}</div>
-        <div class="sitem-size">${fmt(item.size)}</div>
+        <div class="sitem-size">${sizeLabel(item)}</div>
         ${actionsHtml}
       </div>
       <div class="sitem-bar-wrap">
-        <div class="sitem-bar" style="background:${color};width:${Math.max(1,(item.size/maxSz)*100)}%"></div>
+        <div class="sitem-bar" style="background:${color};width:${Math.max(1,((item.size||0)/maxSz)*100)}%"></div>
       </div>`;
 
     if (item.isDir!==false) {
@@ -766,8 +804,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         elif parsed.path == '/stream':
-            params = parse_qs(parsed.query)
-            path = params.get('path', [os.path.expanduser('~')])[0]
+            params = parse_qs(parsed.query, errors='surrogateescape')
+            path = norm_path(params.get('path', ['~'])[0])
             force = params.get('force', ['0'])[0] == '1'
 
             self.send_response(200)
@@ -788,13 +826,16 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     stop.set()
 
-            stream_directory(path, write_event, force=force)
+            try:
+                stream_directory(path, write_event, force=force)
+            except Exception as e:
+                write_event({'type': 'error', 'error': 'Scan failed: %s' % (e or type(e).__name__)})
 
         elif parsed.path == '/invalidate':
-            params = parse_qs(parsed.query)
+            params = parse_qs(parsed.query, errors='surrogateescape')
             path = params.get('path', [''])[0]
             if path:
-                cache_delete(path)
+                cache_delete(norm_path(path))
             self.send_response(200)
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
@@ -810,14 +851,19 @@ class Handler(BaseHTTPRequestHandler):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global _default_path
+    global _default_path, DU_TIMEOUT
     parser = argparse.ArgumentParser(prog="disko", description="disko - interactive disk usage explorer")
     parser.add_argument("--port", type=int, default=8765, help="Port (default: 8765)")
     parser.add_argument("--path", type=str, default=None, help="Starting path (auto-detected if omitted)")
     parser.add_argument("--no-browser", action="store_true", help="Do not open browser")
+    parser.add_argument("--du-timeout", type=float, default=DU_TIMEOUT,
+                        help="Seconds before a single du call is abandoned (default: %d)" % DU_TIMEOUT)
     args = parser.parse_args()
+    if args.du_timeout <= 0:
+        parser.error("--du-timeout must be positive")
+    DU_TIMEOUT = args.du_timeout
     if args.path:
-        _default_path = os.path.normpath(os.path.expanduser(args.path))
+        _default_path = norm_path(args.path)
     elif platform.system() == "Darwin":
         _default_path = "/System/Volumes/Data"
     else:
