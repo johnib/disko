@@ -371,6 +371,53 @@ class TestBoundedScanning(TempTreeMixin, unittest.TestCase):
             time.sleep(0.05)
         self.assertIn('big', [c['name'] for c in disko.cache_get(self.root)['children']])
 
+    def test_stale_revalidation_is_deduped_per_path(self):
+        # Many tabs/reloads on the same stale folder share one rescan.
+        disko.cache_set(self.root, [], scanned_at=time.time() - disko.CACHE_TTL - 10)
+        calls = []
+        real_scan, real_hb = disko.scan_to_list, disko.HEARTBEAT_SECS
+
+        def slow_scan(path):
+            calls.append(path)
+            time.sleep(0.5)
+            return real_scan(path)
+
+        disko.scan_to_list, disko.HEARTBEAT_SECS = slow_scan, 0.05
+        results = []
+        try:
+            def client():
+                events = []
+                disko.stream_directory(self.root, lambda d: d is not None and events.append(d))
+                results.append(events)
+            threads = [threading.Thread(target=client) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        finally:
+            disko.scan_to_list, disko.HEARTBEAT_SECS = real_scan, real_hb
+        self.assertEqual(calls.count(self.root), 1)  # (child prefetches are separate paths)
+        self.assertEqual(len(results), 5)
+        for events in results:
+            types = [e['type'] for e in events]
+            self.assertIn('refresh', types)
+            self.assertEqual(types[-1], 'done')
+        self.assertEqual(disko._revalidations, {})
+
+    def test_macos_root_reports_requested_path(self):
+        # '/' is scanned as the Data volume on macOS but still reported as '/'.
+        real = disko._resolve_scan_path
+        disko._resolve_scan_path = lambda p: self.root if disko.norm_path(p) == '/' else real(p)
+        try:
+            events = []
+            disko.stream_directory('/', events.append)
+        finally:
+            disko._resolve_scan_path = real
+        self.assertEqual(events[0]['type'], 'start')
+        self.assertEqual(events[0]['path'], '/')
+        self.assertEqual(events[0]['name'], '/')
+        self.assertIn('big', [e['name'] for e in events if e['type'] == 'child'])
+
     def test_disconnect_does_not_cache_partial_results(self):
         stop = threading.Event()
         events = []
@@ -446,6 +493,17 @@ class TestCacheStaleness(TempTreeMixin, unittest.TestCase):
         self.assertEqual(root_entry[0]['status'], 'partial')
         self.assertEqual(held[0]['size'], 10)  # old list untouched
 
+    def test_propagation_skips_mount_points(self):
+        # Drilling into a mount point must not pull the other filesystem into the parent's totals.
+        mnt = os.path.join(self.root, 'mnt')
+        disko.cache_set(self.root, [{'name': 'big', 'path': os.path.join(self.root, 'big'), 'size': 100, 'isDir': True},
+                                    {'name': 'mnt', 'path': mnt, 'size': 0, 'isDir': True, 'mount': True}],
+                        scanned_at=100.0)
+        disko.cache_set(mnt, [{'name': 'huge', 'path': os.path.join(mnt, 'huge'), 'size': 10 ** 12, 'isDir': True}],
+                        scanned_at=200.0)
+        sizes = {c['name']: c['size'] for c in disko.cache_get(self.root)['children']}
+        self.assertEqual(sizes, {'big': 100, 'mnt': 0})
+
     def test_propagation_skips_newer_ancestor(self):
         big = os.path.join(self.root, 'big')
         disko.cache_set(self.root, [{'name': 'big', 'path': big, 'size': 10, 'isDir': True}], scanned_at=300.0)
@@ -504,6 +562,16 @@ class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
         self.assertNotIn('%%DEFAULT_PATH%%', text)
         self.assertIn(self.root, text)
 
+    def test_default_path_cannot_break_out_of_script(self):
+        disko._default_path = '/tmp/</script><script>x<!--'
+        status, _, body = self._get('/')
+        self.assertEqual(status, 200)
+        text = body.decode('utf-8')
+        self.assertNotIn('</script><script>x', text)
+        self.assertNotIn('x<!--', text)
+        self.assertIn('\\u003c/script>\\u003cscript>x', text)
+        self.assertIn('</script>', text)
+
     def test_stream_emits_events_then_done(self):
         events = self._stream()
         types = [e['type'] for e in events]
@@ -559,6 +627,45 @@ class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
             self.assertIsNone(resp.getheader('Access-Control-Allow-Origin'))
         finally:
             conn.close()
+
+
+class TestCLI(unittest.TestCase):
+    def setUp(self):
+        self._orig = (sys.argv, disko.DU_TIMEOUT, disko._verbose, disko._default_path)
+
+    def tearDown(self):
+        sys.argv, disko.DU_TIMEOUT, disko._verbose, disko._default_path = self._orig
+
+    def _run_main_expecting_exit(self, *args):
+        sys.argv = ['disko'] + list(args)
+        devnull = open(os.devnull, 'w')
+        real_stderr = sys.stderr
+        sys.stderr = devnull
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                disko.main()
+        finally:
+            sys.stderr = real_stderr
+            devnull.close()
+        return cm.exception.code
+
+    def test_du_timeout_must_be_positive(self):
+        self.assertEqual(self._run_main_expecting_exit('--du-timeout', '0'), 2)
+        self.assertEqual(self._run_main_expecting_exit('--du-timeout', '-5'), 2)
+
+    def test_flags_are_applied(self):
+        # Occupy a port so main() applies the flags, then exits on EADDRINUSE before serving.
+        busy = disko.Server(('localhost', 0), disko.Handler)
+        try:
+            port = busy.server_address[1]
+            code = self._run_main_expecting_exit('--du-timeout', '7.5', '--verbose', '--no-browser',
+                                                 '--port', str(port), '--path', '/tmp/../tmp')
+        finally:
+            busy.server_close()
+        self.assertEqual(code, 1)
+        self.assertEqual(disko.DU_TIMEOUT, 7.5)
+        self.assertTrue(disko._verbose)
+        self.assertEqual(disko._default_path, '/tmp')
 
 
 if __name__ == '__main__':

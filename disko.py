@@ -24,7 +24,7 @@ __version__ = "1.0.0"
 _default_path = "/"
 _verbose = False  # --verbose: log HTTP requests
 
-SCAN_WORKERS = 12   # parallel du workers per scan
+SCAN_WORKERS = 12   # max concurrent du processes (global cap across all scans and prefetches)
 PREFETCH_WORKERS = 4  # background prefetch workers
 CACHE_FILE = os.path.expanduser(os.environ.get('DISKO_CACHE') or '~/.disko_cache.json')
 PREFETCH_TOP_N = 10  # prefetch top-N largest subdirs after each scan
@@ -133,7 +133,8 @@ def _propagate_size(key: str, new_size: int, scanned_at: float, partial: bool = 
         item = next((c for c in entry['children']
                      if c.get('isDir') and _cache_key(c['path']) == child), None)
         new_status = 'partial' if partial else None
-        if item is None or (item.get('size') == new_size and item.get('status') == new_status):
+        # Mount points stay out of their parent's totals (du -x semantics), even once scanned.
+        if item is None or item.get('mount') or (item.get('size') == new_size and item.get('status') == new_status):
             return
         updated = {k: v for k, v in item.items() if k != 'status'}
         updated['size'] = new_size
@@ -340,6 +341,7 @@ _prefetch_pool = concurrent.futures.ThreadPoolExecutor(
 _prefetching: set = set()
 _prefetch_futures: set = set()  # pending/running prefetch futures (for shutdown)
 _prefetch_lock = threading.Lock()
+_revalidations: dict = {}  # path -> in-flight stale-cache rescan job (shared by all streams)
 
 
 def submit_scan(path: str, depth: int = 0) -> bool:
@@ -411,12 +413,29 @@ def _do_prefetch(path: str, depth: int):
             _prefetching.discard(path)
 
 
-def _revalidate(path: str, started: float, result: dict):
+def _start_revalidation(path: str) -> dict:
+    """Return the in-flight stale-cache rescan job for path, starting one if none.
+
+    Deduplicated per path, so many tabs/reloads on the same stale folder share a
+    single rescan. The job dict gets 'fresh' (see _revalidate) and its 'done'
+    event is set when the rescan finishes."""
+    with _prefetch_lock:
+        job = _revalidations.get(path)
+        if job is not None:
+            return job
+        job = {'done': threading.Event(), 'fresh': None}
+        _revalidations[path] = job
+    threading.Thread(target=_revalidate, args=(path, job), daemon=True).start()
+    return job
+
+
+def _revalidate(path: str, job: dict):
     """Rescan a stale cached dir for stream_directory (runs in a worker thread).
 
-    Sets result['fresh'] to the listing to stream ({'children', 'scanned_at'}),
-    or leaves it unset if the dir can't be read. Registers in _prefetching so a
+    Sets job['fresh'] to the listing to stream ({'children', 'scanned_at'}),
+    or leaves it None if the dir can't be read. Registers in _prefetching so a
     concurrent prefetch of the same path is skipped."""
+    started = time.time()
     with _prefetch_lock:
         owned = path not in _prefetching
         _prefetching.add(path)
@@ -427,15 +446,17 @@ def _revalidate(path: str, started: float, result: dict):
         if _cacheable(children):
             cache_set(path, children, scanned_at=started)
             # A newer scan may have won the race; stream whatever the cache now holds.
-            result['fresh'] = cache_get(path) or {'children': children, 'scanned_at': started}
+            job['fresh'] = cache_get(path) or {'children': children, 'scanned_at': started}
         else:
             # Unknown sizes aren't cached (so they get retried) but are still shown.
-            result['fresh'] = {'children': children, 'scanned_at': started}
-        schedule_prefetch(result['fresh']['children'])
+            job['fresh'] = {'children': children, 'scanned_at': started}
+        schedule_prefetch(job['fresh']['children'])
     finally:
-        if owned:
-            with _prefetch_lock:
+        with _prefetch_lock:
+            if owned:
                 _prefetching.discard(path)
+            _revalidations.pop(path, None)
+        job['done'].set()
 
 
 # ── Streaming (SSE) ───────────────────────────────────────────────────────────
@@ -443,6 +464,11 @@ def _revalidate(path: str, started: float, result: dict):
 def stream_directory(path: str, write_event, force: bool = False, stop=None):
     if stop is None:
         stop = threading.Event()
+    # Report the path the client asked for ('/' stays '/' even though macOS scans the
+    # Data volume), so the breadcrumb and Up button treat it as the root.
+    shown = norm_path(path)
+    if shown == '//':
+        shown = '/'
     path = _resolve_scan_path(path)
     if not os.path.isdir(path):
         write_event({'type': 'error', 'error': 'Not a directory or not found'})
@@ -454,8 +480,8 @@ def stream_directory(path: str, write_event, force: bool = False, stop=None):
         # Serve cache immediately
         write_event({
             'type': 'start',
-            'path': path,
-            'name': os.path.basename(path) or path,
+            'path': shown,
+            'name': os.path.basename(shown) or shown,
             'total_dirs': len(cached['children']),
             'from_cache': True,
             'scanned_at': cached['scanned_at'],
@@ -471,24 +497,19 @@ def stream_directory(path: str, write_event, force: bool = False, stop=None):
         # The scan runs in a worker so we can heartbeat (and notice disconnects)
         # meanwhile; it finishes and updates the cache even if the client leaves.
         write_event({'type': 'revalidating'})
-        started = time.time()
-        result = {}
-        worker = threading.Thread(target=_revalidate, args=(path, started, result), daemon=True)
-        worker.start()
-        while worker.is_alive() and not stop.is_set():
-            worker.join(HEARTBEAT_SECS)
-            if worker.is_alive():
-                write_event(None)  # heartbeat: detects a disconnected client
+        job = _start_revalidation(path)  # joins an in-flight rescan of path if there is one
+        while not stop.is_set() and not job['done'].wait(HEARTBEAT_SECS):
+            write_event(None)  # heartbeat: detects a disconnected client
         if stop.is_set():
             return
-        fresh = result.get('fresh')
+        fresh = job['fresh']
         if fresh is None:  # dir became unreadable: keep showing the cached listing
             write_event({'type': 'done'})
             return
         write_event({
             'type': 'refresh',
-            'path': path,
-            'name': os.path.basename(path) or path,
+            'path': shown,
+            'name': os.path.basename(shown) or shown,
             'total_dirs': len(fresh['children']),
             'scanned_at': fresh['scanned_at'],
         })
@@ -511,8 +532,8 @@ def stream_directory(path: str, write_event, force: bool = False, stop=None):
 
     write_event({
         'type': 'start',
-        'path': path,
-        'name': os.path.basename(path) or path,
+        'path': shown,
+        'name': os.path.basename(shown) or shown,
         'total_dirs': total_dirs,
         'from_cache': False,
     })
@@ -1309,7 +1330,7 @@ function renderSidebar(data) {
     main.append(top, barWrap);
     div.appendChild(main);
 
-    if (isDir) {
+    if (isDir && !item.mount) {  // mounts stay out of totals, so there is no size to refresh
       const actions = el('div', 'sitem-actions');
       const btn = el('button', 'sitem-refresh-btn', '↺');
       btn.type = 'button';
