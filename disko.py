@@ -750,11 +750,14 @@ function timeAgo(ts) {
 // Keep the largest (max-1) items and fold the rest into one aggregate entry.
 function capChildren(children, max, parentPath) {
   if (children.length <= max) return children;
-  const sorted = children.slice().sort((a,b) => b.size-a.size);
+  const sorted = children.slice().sort((a,b) => (b.size||0)-(a.size||0));
   const kept = sorted.slice(0, max-1), rest = sorted.slice(max-1);
-  const size = rest.reduce((s,c) => s+c.size, 0);
-  kept.push({ name: `${rest.length} smaller items`, path: parentPath||'',
-              size, isDir: false, aggregate: true });
+  const size = rest.reduce((s,c) => s+(c.size||0), 0);
+  const agg = { name: `${rest.length} smaller items`, path: parentPath||'',
+                size, isDir: false, aggregate: true };
+  // Folded entries with partial/unknown sizes make the aggregate a lower bound.
+  if (rest.some(c => c.status)) agg.status = 'partial';
+  kept.push(agg);
   return kept;
 }
 
@@ -808,6 +811,7 @@ function startStream(path, force, gen, callbacks) {
 // Abort any in-flight scan and reset the scan UI (used by Back / breadcrumb).
 function cancelStream() {
   navGen++;
+  cancelRender();
   if (activeES) { activeES.close(); activeES = null; }
   hideCacheBadge();
   setProgress(-1);
@@ -1115,7 +1119,7 @@ function renderSidebar(data) {
     note.style.animation = 'none';
     note.innerHTML = '<div class="sitem-top"><div class="sitem-name"></div><div class="sitem-size"></div></div>';
     note.querySelector('.sitem-name').textContent = `+ ${hidden.length} smaller items not shown`;
-    note.querySelector('.sitem-size').textContent = fmt(hidden.reduce((s,c) => s+c.size, 0));
+    note.querySelector('.sitem-size').textContent = fmt(hidden.reduce((s,c) => s+(c.size||0), 0));
     list.appendChild(note);
   }
 }
