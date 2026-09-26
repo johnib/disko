@@ -11,16 +11,15 @@ Only the latest release of disko receives security fixes.
 
 ## Reporting a vulnerability
 
-Please report security vulnerabilities by opening a GitHub issue in this
-repository and applying the **"security"** label.
+Please report security vulnerabilities privately using GitHub's
+[Private Vulnerability Reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability):
+go to the repository's **Security** tab and click **Report a vulnerability**.
+Please do **not** open a public issue for security problems.
 
 You can expect an initial response within **7 days**. If the issue is confirmed,
 a fix will be prioritized and a patched release will be published as soon as
-reasonably possible. You will be kept informed of progress via the issue thread.
-
-Please do not include sensitive exploit details in a public issue. If the
-vulnerability requires confidential disclosure, mention that in the issue and
-we will arrange a private channel.
+reasonably possible. You will be kept informed of progress via the private
+advisory thread.
 
 ## Security model
 
@@ -28,6 +27,13 @@ disko is designed with the following security properties:
 
 - **Localhost only** — the embedded HTTP server binds exclusively to `127.0.0.1`
   and is not accessible from other machines on the network.
+- **Protected against malicious websites** — a web page open in your browser
+  can reach `localhost`, so the server treats the browser as part of the threat
+  model. It sends no CORS headers (the UI is same-origin), rejects requests whose
+  `Host` header is not `localhost`/`127.0.0.1` on disko's port (defeating DNS
+  rebinding), and rejects cross-site requests based on the `Origin` and
+  `Sec-Fetch-Site` headers (preventing CSRF-style scans or cache clearing and
+  cross-origin reads of directory listings). Such requests get `403 Forbidden`.
 - **No sensitive file contents** — the persistent cache stores only directory
   paths and size metadata. File contents are never read or stored.
 - **No outbound requests** — disko makes no outbound network requests except to
