@@ -11,6 +11,7 @@ import errno
 import json
 import os
 import platform
+import signal
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,8 @@ PREFETCH_MAX_DEPTH = 1  # how many levels below a scanned dir to prefetch
 CACHE_TTL = 300  # seconds; older cache hits are served, then re-scanned and re-streamed
 HEARTBEAT_SECS = 2  # SSE keepalive interval while waiting on du (detects disconnects)
 DU_TIMEOUT = 300     # seconds per du call (overridable via --du-timeout)
+DU_POLL_SECS = 0.2   # how often a running du checks whether it should be killed
+BG_DU_SLOTS = 4      # of SCAN_WORKERS, how many du processes background work may hold
 
 # ── Cache ────────────────────────────────────────────────────────────────────
 
@@ -217,40 +220,99 @@ def norm_path(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
-def du_single(path: str):
+def du_single(path: str, cancel=None):
     """Return (size_bytes_or_None, status).
 
     status is None on success, 'partial' when du exited non-zero but still
-    reported a total (e.g. unreadable subdirs), 'timeout', or an error string
+    reported a total (e.g. unreadable subdirs), 'timeout', 'cancelled' (the
+    `cancel` callable returned True, so du was killed), or an error string
     when no size could be determined (size is then None).
     """
     try:
-        r = subprocess.run(["du", "-sk", "-x", "--", path],
-                           capture_output=True, timeout=DU_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return None, 'timeout'
+        proc = subprocess.Popen(["du", "-sk", "-x", "--", path],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError as e:
         return None, str(e) or 'du failed'
+    deadline = time.monotonic() + DU_TIMEOUT
+    while True:
+        try:
+            out, err = proc.communicate(timeout=DU_POLL_SECS)
+            break
+        except subprocess.TimeoutExpired:
+            cancelled = _shutting_down.is_set() or (cancel is not None and cancel())
+            status = 'cancelled' if cancelled else (
+                'timeout' if time.monotonic() >= deadline else None)
+            if status:
+                proc.kill()
+                proc.communicate()
+                return None, status
     try:
-        kb = int(r.stdout.split(b'\t', 1)[0])
+        kb = int(out.split(b'\t', 1)[0])
     except ValueError:
-        err = r.stderr.decode('utf-8', 'replace').strip().splitlines()
-        return None, (err[0][:200] if err else 'du failed (exit %d)' % r.returncode)
-    return kb * 1024, ('partial' if r.returncode else None)
+        lines = err.decode('utf-8', 'replace').strip().splitlines()
+        return None, (lines[0][:200] if lines else 'du failed (exit %d)' % proc.returncode)
+    return kb * 1024, ('partial' if proc.returncode else None)
 
 
 _du_slots = threading.BoundedSemaphore(SCAN_WORKERS)  # global cap on concurrent du processes
+_bg_slots = threading.BoundedSemaphore(BG_DU_SLOTS)   # background share of it: live scans keep the rest
+
+# Live (user-facing) scans take priority over background work: background du calls
+# don't start while a live scan runs, and running prefetch du calls get killed when
+# one starts (their results are dropped; the folder is scanned again when opened).
+_live_cv = threading.Condition()
+_live_count = 0
+_live_gen = 0  # bumped each time a live scan starts
+_shutting_down = threading.Event()  # set on Ctrl+C/SIGTERM: kill every du, stop waiting
 
 
-def du_bounded(path: str, stop=None):
-    """du_single, limited by the global du semaphore; skipped if stop is set.
+class live_scan(object):
+    """Context manager marking a user-facing scan as in progress."""
+
+    def __enter__(self):
+        global _live_count, _live_gen
+        with _live_cv:
+            _live_count += 1
+            _live_gen += 1
+
+    def __exit__(self, *exc):
+        global _live_count
+        with _live_cv:
+            _live_count -= 1
+            _live_cv.notify_all()
+
+
+def _wait_for_no_live_scan() -> int:
+    """Block until no live scan is running; return the live-scan generation then."""
+    with _live_cv:
+        while _live_count and not _shutting_down.is_set():
+            _live_cv.wait(0.5)
+        return _live_gen
+
+
+def du_bounded(path: str, stop=None, background=None):
+    """du_single, limited by the global du semaphore.
+
+    Live scans (background=None) are skipped/killed once `stop` is set.
+    background='prefetch' waits for live scans to finish and is killed if a new one
+    starts; background='revalidate' only waits (its result replaces a listing the
+    user is looking at, so it isn't thrown away).
 
     Returns du_single's (size_or_None, status) tuple.
     """
+    if background:
+        with _bg_slots:
+            gen = _wait_for_no_live_scan()
+            with _du_slots:
+                if _shutting_down.is_set():
+                    return None, 'cancelled'
+                if background == 'prefetch':
+                    return du_single(path, lambda: _live_gen != gen)
+                return du_single(path)
     with _du_slots:
         if stop is not None and stop.is_set():
             return None, 'cancelled'
-        return du_single(path)
+        return du_single(path, stop.is_set if stop is not None else None)
 
 
 def _dir_child(entry, result) -> dict:
@@ -280,7 +342,7 @@ def _list_entries(path: str):
     return dirs, file_total
 
 
-def _iter_children(path: str, dirs: list, file_total: int, stop=None):
+def _iter_children(path: str, dirs: list, file_total: int, stop=None, background=None):
     """Yield path's child dicts: mount points first (never du'ed), then each subdir
     as its du completes, then the "(loose files)" entry.
 
@@ -294,7 +356,7 @@ def _iter_children(path: str, dirs: list, file_total: int, stop=None):
         yield _mount_child(e)
     # Not a `with` block: its exit would wait for every running du after a disconnect
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS)
-    futures = {ex.submit(du_bounded, e.path, stop): e for e in dirs}
+    futures = {ex.submit(du_bounded, e.path, stop, background): e for e in dirs}
     pending = set(futures)
     try:
         while pending and not (stop is not None and stop.is_set()):
@@ -321,15 +383,17 @@ def _iter_children(path: str, dirs: list, file_total: int, stop=None):
         }
 
 
-def scan_to_list(path: str):
-    """Scan path and return list of child dicts, or None if it can't be read."""
+def scan_to_list(path: str, background=None):
+    """Scan path and return list of child dicts, or None if it can't be read.
+
+    `background` is passed to du_bounded ('prefetch' / 'revalidate')."""
     path = _resolve_scan_path(path)
     try:
         dirs, file_total = _list_entries(path)
     except OSError:
         return None
 
-    children = [c for c in _iter_children(path, dirs, file_total) if c is not None]
+    children = [c for c in _iter_children(path, dirs, file_total, background=background) if c is not None]
     children.sort(key=_size_key)
     return children
 
@@ -377,7 +441,8 @@ def _prefetch_done(path: str, fut):
 
 
 def stop_prefetch():
-    """Cancel queued prefetch scans and stop accepting new ones."""
+    """Cancel queued prefetch scans, kill running du processes, stop accepting new scans."""
+    _shutting_down.set()
     with _prefetch_lock:
         pending = list(_prefetch_futures)
     for fut in pending:
@@ -402,9 +467,9 @@ def schedule_prefetch(children: list, depth: int = PREFETCH_MAX_DEPTH):
 def _do_prefetch(path: str, depth: int):
     try:
         started = time.time()
-        children = scan_to_list(path)
-        if children is None:
-            return
+        children = scan_to_list(path, background='prefetch')
+        if children is None or any(c.get('status') == 'cancelled' for c in children):
+            return  # unreadable, or preempted by a live scan
         if _cacheable(children):
             cache_set(path, children, scanned_at=started)
         schedule_prefetch(children, depth)
@@ -440,7 +505,7 @@ def _revalidate(path: str, job: dict):
         owned = path not in _prefetching
         _prefetching.add(path)
     try:
-        children = scan_to_list(path)
+        children = scan_to_list(path, background='revalidate')
         if children is None:
             return
         if _cacheable(children):
@@ -539,16 +604,17 @@ def stream_directory(path: str, write_event, force: bool = False, stop=None):
     })
 
     collected = []
-    children = _iter_children(path, dirs, file_total, stop)
-    try:
-        for child in children:
-            if child is None:
-                write_event(None)  # heartbeat: detects a disconnected client
-                continue
-            collected.append(child)
-            write_event({'type': 'child', **child})
-    finally:
-        children.close()  # cancels queued du calls if we bail out early
+    with live_scan():  # background du work yields to this scan
+        children = _iter_children(path, dirs, file_total, stop)
+        try:
+            for child in children:
+                if child is None:
+                    write_event(None)  # heartbeat: detects a disconnected client
+                    continue
+                collected.append(child)
+                write_event({'type': 'child', **child})
+        finally:
+            children.close()  # cancels queued du calls if we bail out early
     if stop.is_set():
         return  # client went away: don't cache partial results
 
@@ -722,6 +788,23 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid #e94560; out
 #error-title, #d3-title { color: #e94560; font-size: 15px; font-weight: 600; }
 #error-detail, #d3-detail { color: #94a3b8; font-size: 12px; }
 
+/* ── Loading ── */
+#loading-overlay {
+  position: absolute; inset: 0; display: none;
+  align-items: center; justify-content: center; flex-direction: column; gap: 10px;
+  background: rgba(17,19,24,.55); pointer-events: none;
+}
+#loading-overlay.show { display: flex; }
+.loading-spinner {
+  width: 28px; height: 28px; border-radius: 50%;
+  border: 3px solid #334155; border-top-color: #e94560;
+  animation: spin .8s linear infinite;
+}
+#loading-title { color: #e2e8f0; font-size: 14px; font-weight: 600; max-width: 80%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#loading-detail { color: #94a3b8; font-size: 12px; }
+@media (prefers-reduced-motion: reduce) { .loading-spinner { animation-duration: 2.4s; } }
+
 /* ── Empty state ── */
 #empty-state {
   position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
@@ -779,6 +862,11 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid #e94560; out
   <div id="treemap-wrap">
     <svg id="treemap" role="img" aria-label="Treemap of folder contents by size"></svg>
     <div id="empty-state">This folder is empty</div>
+    <div id="loading-overlay" role="status" aria-live="polite">
+      <div class="loading-spinner"></div>
+      <div id="loading-title"></div>
+      <div id="loading-detail"></div>
+    </div>
     <div id="error-overlay" role="alert">
       <div id="error-title">⚠ Could not scan</div>
       <div id="error-detail"></div>
@@ -934,6 +1022,7 @@ function cancelStream() {
   cancelRender();
   if (activeES) { activeES.close(); activeES = null; }
   hideCacheBadge();
+  hideLoading();
   setProgress(-1);
   setScanStatus('', true);
   document.getElementById('refresh-btn').classList.remove('spinning');
@@ -949,6 +1038,7 @@ function navigate(path, force, onCommit) {
   hideCacheBadge();
   setProgress(0);
   setScanStatus('scanning…', false);
+  showLoading(path);
 
   let items = [];
   let meta = null, totalDirs = 0, received = 0, refreshing = false;
@@ -958,6 +1048,10 @@ function navigate(path, force, onCommit) {
       if (onCommit) onCommit();
       meta = msg; totalDirs = msg.total_dirs;
       if (msg.from_cache) showCacheBadge(msg.scanned_at);
+      else if (msg.total_dirs > 0) {
+        setLoadingPhase(`Measuring ${msg.total_dirs} item${msg.total_dirs === 1 ? '' : 's'}`);
+        setScanStatus(`0 / ${msg.total_dirs}`, false);
+      }
       render({ path: msg.path, name: msg.name, size: 0, children: [] });
     },
     onRevalidating() {
@@ -973,6 +1067,7 @@ function navigate(path, force, onCommit) {
     },
     onChild(item) {
       received++;
+      if (received === 1) hideLoading();
       // Insert sorted by size
       let lo = 0, hi = items.length;
       while (lo < hi) { const mid = (lo+hi)>>1; (items[mid].size||0) >= (item.size||0) ? lo=mid+1 : hi=mid; }
@@ -988,6 +1083,7 @@ function navigate(path, force, onCommit) {
       });
     },
     onDone() {
+      hideLoading();
       flushRender();
       if (refreshing) {
         hideCacheBadge();
@@ -1000,6 +1096,7 @@ function navigate(path, force, onCommit) {
       document.getElementById('refresh-btn').classList.remove('spinning');
     },
     onError(err) {
+      hideLoading();
       flushRender();
       setProgress(-1); setScanStatus('', true);
       document.getElementById('error-detail').textContent = err;
@@ -1171,6 +1268,33 @@ function setProgress(pct) {
 function setScanStatus(txt, done) {
   document.getElementById('scan-text').textContent = txt;
   document.getElementById('scan-dot').classList.toggle('active', !done);
+}
+
+// Shown from the moment a folder is opened until its first size arrives, so a slow
+// du never looks like a frozen UI.
+let loadingTimer = null;
+function showLoading(path) {
+  hideLoading();
+  const started = Date.now();
+  const name = path.split('/').filter(Boolean).pop() || path;
+  document.getElementById('loading-title').textContent = 'Scanning ' + name + '…';
+  const detail = document.getElementById('loading-detail');
+  let phase = 'Listing folder';
+  const tick = () => {
+    const secs = Math.floor((Date.now() - started) / 1000);
+    detail.textContent = phase + (secs >= 1 ? ' · ' + secs + 's' : '');
+  };
+  tick();
+  loadingTimer = setInterval(tick, 1000);
+  loadingTimer.setPhase = t => { phase = t; tick(); };
+  document.getElementById('loading-overlay').classList.add('show');
+}
+function setLoadingPhase(text) {
+  if (loadingTimer) loadingTimer.setPhase(text);
+}
+function hideLoading() {
+  if (loadingTimer) { clearInterval(loadingTimer); loadingTimer = null; }
+  document.getElementById('loading-overlay').classList.remove('show');
 }
 
 function showCacheBadge(ts) {
@@ -1505,6 +1629,10 @@ def main():
     print("  Ctrl+C to stop")
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+
+    def on_sigterm(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, on_sigterm)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

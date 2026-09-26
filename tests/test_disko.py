@@ -178,7 +178,7 @@ class TestScanToList(TempTreeMixin, unittest.TestCase):
         calls = []
         real_du = disko.du_single
         disko._split_mounts = fake_split
-        disko.du_single = lambda p: (calls.append(p), real_du(p))[1]
+        disko.du_single = lambda p, *a: (calls.append(p), real_du(p, *a))[1]
         try:
             children = disko.scan_to_list(self.root)
         finally:
@@ -377,10 +377,10 @@ class TestBoundedScanning(TempTreeMixin, unittest.TestCase):
         calls = []
         real_scan, real_hb = disko.scan_to_list, disko.HEARTBEAT_SECS
 
-        def slow_scan(path):
+        def slow_scan(path, **kw):
             calls.append(path)
             time.sleep(0.5)
-            return real_scan(path)
+            return real_scan(path, **kw)
 
         disko.scan_to_list, disko.HEARTBEAT_SECS = slow_scan, 0.05
         results = []
@@ -441,7 +441,7 @@ class TestBoundedScanning(TempTreeMixin, unittest.TestCase):
 
     def test_unknown_size_scan_is_streamed_but_not_cached(self):
         orig = disko.du_single
-        disko.du_single = lambda path: (None, 'timeout')
+        disko.du_single = lambda path, *a: (None, 'timeout')
         try:
             events = []
             disko.stream_directory(self.root, events.append)
@@ -452,6 +452,98 @@ class TestBoundedScanning(TempTreeMixin, unittest.TestCase):
         self.assertTrue(all(k['size'] is None and k['status'] == 'timeout' for k in kids))
         self.assertEqual(events[-1]['type'], 'done')
         self.assertIsNone(disko.cache_get(self.root))
+
+
+class TestScanPriority(TempTreeMixin, unittest.TestCase):
+    """A running du is killed when its scan is abandoned, and live scans come first."""
+
+    def setUp(self):
+        super(TestScanPriority, self).setUp()
+        self.real_popen = disko.subprocess.Popen
+
+    def tearDown(self):
+        disko.subprocess.Popen = self.real_popen
+        super(TestScanPriority, self).tearDown()
+
+    def _slow_du(self, procs):
+        """Make every du a 30s sleep, recording the processes."""
+        real = self.real_popen
+
+        def popen(cmd, **kw):
+            proc = real([sys.executable, '-c', 'import time; time.sleep(30)'], **kw)
+            procs.append(proc)
+            return proc
+        disko.subprocess.Popen = popen
+
+    def test_cancel_kills_running_du(self):
+        procs, flag = [], threading.Event()
+        self._slow_du(procs)
+        threading.Timer(0.3, flag.set).start()
+        t0 = time.time()
+        self.assertEqual(disko.du_single(self.root, flag.is_set), (None, 'cancelled'))
+        self.assertLess(time.time() - t0, 5)
+        self.assertIsNotNone(procs[0].poll())  # process is gone, not orphaned
+
+    def test_timeout_kills_running_du(self):
+        procs = []
+        self._slow_du(procs)
+        orig = disko.DU_TIMEOUT
+        disko.DU_TIMEOUT = 0.3
+        try:
+            self.assertEqual(disko.du_single(self.root), (None, 'timeout'))
+        finally:
+            disko.DU_TIMEOUT = orig
+        self.assertIsNotNone(procs[0].poll())
+
+    def test_disconnect_kills_live_scan_du(self):
+        procs, stop, events = [], threading.Event(), []
+        self._slow_du(procs)
+        threading.Timer(0.3, stop.set).start()
+        t0 = time.time()
+        disko.stream_directory(self.root, events.append, stop=stop)
+        deadline = time.time() + 5
+        while any(p.poll() is None for p in procs) and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(procs)
+        self.assertTrue(all(p.poll() is not None for p in procs))
+        self.assertLess(time.time() - t0, 5)
+
+    def test_live_scan_preempts_prefetch_du(self):
+        procs = []
+        self._slow_du(procs)
+        result = []
+        t = threading.Thread(target=lambda: result.append(disko.du_bounded(self.root, background='prefetch')))
+        t.start()
+        deadline = time.time() + 5
+        while not procs and time.time() < deadline:
+            time.sleep(0.02)
+        with disko.live_scan():
+            t.join(5)
+        self.assertEqual(result, [(None, 'cancelled')])
+        self.assertIsNotNone(procs[0].poll())
+
+    def test_background_du_waits_for_live_scan(self):
+        result = []
+        with disko.live_scan():
+            t = threading.Thread(target=lambda: result.append(
+                disko.du_bounded(os.path.join(self.root, 'big'), background='revalidate')))
+            t.start()
+            time.sleep(0.3)
+            self.assertEqual(result, [])  # still waiting
+        t.join(10)
+        self.assertIsNone(result[0][1])
+        self.assertGreater(result[0][0], 0)
+
+    def test_preempted_prefetch_is_not_cached(self):
+        orig = disko.du_single
+        disko.du_single = lambda path, *a: (None, 'cancelled')
+        try:
+            disko._prefetching.add(self.root)
+            disko._do_prefetch(self.root, 1)
+        finally:
+            disko.du_single = orig
+        self.assertIsNone(disko.cache_get(self.root))
+        self.assertNotIn(self.root, disko._prefetching)
 
 
 class TestCacheStaleness(TempTreeMixin, unittest.TestCase):
