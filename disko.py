@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 import webbrowser
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 __version__ = "1.0.0"
@@ -25,12 +25,15 @@ SCAN_WORKERS = 12   # parallel du workers per scan
 PREFETCH_WORKERS = 4  # background prefetch workers
 CACHE_FILE = os.path.expanduser(os.environ.get('DISKO_CACHE') or '~/.disko_cache.json')
 PREFETCH_TOP_N = 10  # prefetch top-N largest subdirs after each scan
+PREFETCH_MAX_DEPTH = 1  # how many levels below a scanned dir to prefetch
+REFRESH_MIN_AGE = 300  # seconds; cache hits older than this trigger a background refresh
+HEARTBEAT_SECS = 2  # SSE keepalive interval while waiting on du (detects disconnects)
 
 # ── Cache ────────────────────────────────────────────────────────────────────
 
 _cache: dict = {}
 _cache_lock = threading.Lock()
-_save_lock = threading.Lock()
+_save_lock = threading.Lock()  # serializes file writes without blocking cache_get
 # Never persist as root: avoids writing a root-owned file into a (possibly sudo-inherited) home dir.
 _persist_cache = not (hasattr(os, 'geteuid') and os.geteuid() == 0)
 
@@ -56,9 +59,11 @@ def cache_load():
 def cache_save():
     if not _persist_cache:
         return
-    with _cache_lock:
-        data = json.dumps(_cache)
+    # Snapshot under the cache lock, but do the (slow) file write outside it.
+    # Snapshot inside the save lock so an older snapshot can't overwrite a newer one.
     with _save_lock:
+        with _cache_lock:
+            data = json.dumps(_cache)
         tmp = None
         try:
             # mkstemp creates the file 0600 in the same dir, so os.replace is an atomic rename
@@ -114,6 +119,17 @@ def du_single(path: str) -> int:
     return 0
 
 
+_du_slots = threading.BoundedSemaphore(SCAN_WORKERS)  # global cap on concurrent du processes
+
+
+def du_bounded(path: str, stop=None) -> int:
+    """du_single, limited by the global du semaphore; skipped if stop is set."""
+    with _du_slots:
+        if stop is not None and stop.is_set():
+            return 0
+        return du_single(path)
+
+
 def scan_to_list(path: str) -> list:
     """Scan path and return list of child dicts."""
     path = os.path.normpath(os.path.expanduser(path))
@@ -134,7 +150,7 @@ def scan_to_list(path: str) -> list:
 
     children = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
-        futures = {ex.submit(du_single, e.path): e for e in dirs}
+        futures = {ex.submit(du_bounded, e.path): e for e in dirs}
         for fut in concurrent.futures.as_completed(futures):
             entry = futures[fut]
             children.append({
@@ -172,25 +188,41 @@ _prefetching: set = set()
 _prefetch_lock = threading.Lock()
 
 
-def schedule_prefetch(children: list):
-    """Kick off background scans for the top-N largest child dirs."""
+def submit_scan(path: str, depth: int = 0) -> bool:
+    """Scan path in the background (deduped against in-flight scans), then
+    prefetch `depth` levels of its children. Returns False if already running."""
+    with _prefetch_lock:
+        if path in _prefetching:
+            return False
+        _prefetching.add(path)
+    try:
+        _prefetch_pool.submit(_do_prefetch, path, depth)
+    except RuntimeError:  # pool shut down (interpreter exiting)
+        with _prefetch_lock:
+            _prefetching.discard(path)
+        return False
+    return True
+
+
+def schedule_prefetch(children: list, depth: int = PREFETCH_MAX_DEPTH):
+    """Kick off background scans for the top-N largest uncached child dirs,
+    going at most `depth` levels down."""
+    if depth <= 0:
+        return
     dirs = [c for c in children if c.get('isDir') and c['size'] > 0]
     dirs = sorted(dirs, key=lambda c: -c['size'])[:PREFETCH_TOP_N]
     for d in dirs:
         p = d['path']
-        with _prefetch_lock:
-            if p in _prefetching or cache_get(p):
-                continue
-            _prefetching.add(p)
-        _prefetch_pool.submit(_do_prefetch, p)
+        if cache_get(p):
+            continue
+        submit_scan(p, depth - 1)
 
 
-def _do_prefetch(path: str):
+def _do_prefetch(path: str, depth: int):
     try:
         children = scan_to_list(path)
         cache_set(path, children)
-        # One more level deep
-        schedule_prefetch(children)
+        schedule_prefetch(children, depth)
     finally:
         with _prefetch_lock:
             _prefetching.discard(path)
@@ -198,7 +230,9 @@ def _do_prefetch(path: str):
 
 # ── Streaming (SSE) ───────────────────────────────────────────────────────────
 
-def stream_directory(path: str, write_event, force: bool = False):
+def stream_directory(path: str, write_event, force: bool = False, stop=None):
+    if stop is None:
+        stop = threading.Event()
     path = os.path.normpath(os.path.expanduser(path))
     if not os.path.isdir(path):
         write_event({'type': 'error', 'error': 'Not a directory or not found'})
@@ -220,12 +254,9 @@ def stream_directory(path: str, write_event, force: bool = False):
             write_event({'type': 'child', **child})
         write_event({'type': 'done'})
 
-        # Silent background refresh
-        def refresh():
-            new_children = scan_to_list(path)
-            cache_set(path, new_children)
-            schedule_prefetch(new_children)
-        threading.Thread(target=refresh, daemon=True).start()
+        # Silent background refresh, only when stale; deduped with prefetch
+        if time.time() - cached['scanned_at'] > REFRESH_MIN_AGE:
+            submit_scan(path, PREFETCH_MAX_DEPTH)
         return
 
     # Live scan
@@ -250,18 +281,33 @@ def stream_directory(path: str, write_event, force: bool = False):
     })
 
     collected = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
-        futures = {ex.submit(du_single, e.path): e for e in dirs}
-        for fut in concurrent.futures.as_completed(futures):
-            entry = futures[fut]
-            child = {
-                'name': entry.name,
-                'path': entry.path,
-                'size': fut.result(),
-                'isDir': True,
-            }
-            collected.append(child)
-            write_event({'type': 'child', **child})
+    # Not a `with` block: its exit would wait for every running du after a disconnect
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS)
+    futures = {ex.submit(du_bounded, e.path, stop): e for e in dirs}
+    pending = set(futures)
+    try:
+        while pending and not stop.is_set():
+            done, pending = concurrent.futures.wait(
+                pending, timeout=HEARTBEAT_SECS,
+                return_when=concurrent.futures.FIRST_COMPLETED)
+            if not done:
+                write_event(None)  # heartbeat: detects a disconnected client
+            for fut in done:
+                entry = futures[fut]
+                child = {
+                    'name': entry.name,
+                    'path': entry.path,
+                    'size': fut.result(),
+                    'isDir': True,
+                }
+                collected.append(child)
+                write_event({'type': 'child', **child})
+    finally:
+        for f in pending:  # manual cancel_futures (Python 3.8 compatible)
+            f.cancel()
+        ex.shutdown(wait=False)
+    if stop.is_set():
+        return  # client went away: don't cache partial results
 
     if file_total > 0:
         loose = {'name': '(loose files)', 'path': path, 'size': file_total, 'isDir': False}
@@ -822,12 +868,15 @@ class Handler(BaseHTTPRequestHandler):
                 if stop.is_set():
                     return
                 try:
-                    self.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
+                    if data is None:  # SSE comment, ignored by EventSource
+                        self.wfile.write(b": keepalive\n\n")
+                    else:
+                        self.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
                     self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
+                except OSError:  # BrokenPipe, ConnectionReset, etc.
                     stop.set()
 
-            stream_directory(path, write_event, force=force)
+            stream_directory(path, write_event, force=force, stop=stop)
 
         elif parsed.path == '/invalidate':
             params = parse_qs(parsed.query)
@@ -845,6 +894,10 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -860,7 +913,7 @@ def main():
         _default_path = os.path.expanduser("~")
     port = args.port
     cache_load()
-    server = HTTPServer(("localhost", port), Handler)
+    server = Server(("localhost", port), Handler)
     url = f"http://localhost:{port}"
     print(f"  disko v{__version__} -> {url}")
     print(f"  Cache: {CACHE_FILE}")
