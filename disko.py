@@ -148,10 +148,25 @@ def _sound_entry(entry) -> bool:
             and _finite_number(entry.get('scanned_at')))
 
 
+def _current_entry(entry) -> bool:
+    """True if entry is sound AND stamped with the current CACHE_VERSION.
+
+    Distinct from _sound_entry: a pre-migration (old-version or unversioned) entry can
+    be perfectly well-typed -- it just holds the old shape -- so _sound_entry alone isn't
+    enough to decide "is this safe to compare/build on as current data". Used everywhere
+    an old-version entry must be treated the same as absent, never as authoritative data
+    to race a fresh scan against: cache_get's read, cache_set's newer-scan-wins guard (an
+    old entry with a coincidentally-later scanned_at must not block its own replacement,
+    or the promised one-time migration would never happen), and _propagate_size's
+    ancestor update (writing into a dead, about-to-be-discarded old-shaped entry gains
+    nothing and only risks re-triggering the same not-current-version bugs)."""
+    return _sound_entry(entry) and entry.get('version') == CACHE_VERSION
+
+
 def cache_get(path: str):
     with _cache_lock:
         entry = _cache.get(_cache_key(path))
-        if not _sound_entry(entry) or entry.get('version') != CACHE_VERSION:
+        if not _current_entry(entry):
             return None  # old/foreign/malformed shape: treat as a miss, not a crash or stale render
         return entry
 
@@ -169,7 +184,7 @@ def cache_set(path: str, children: list, scanned_at: float = None) -> bool:
         scanned_at = time.time()
     with _cache_lock:
         existing = _cache.get(key)
-        if _sound_entry(existing) and existing.get('scanned_at', 0) > scanned_at:
+        if _current_entry(existing) and existing.get('scanned_at', 0) > scanned_at:
             return False
         _cache[key] = {'children': children, 'scanned_at': scanned_at, 'version': CACHE_VERSION}
         _propagate_size(key, sum(c.get('size') or 0 for c in children), scanned_at,
@@ -187,7 +202,7 @@ def _propagate_size(key: str, new_size: int, scanned_at: float, partial: bool = 
     parent = os.path.dirname(child)
     while parent != child:
         entry = _cache.get(parent)
-        if not _sound_entry(entry) or entry.get('scanned_at', 0) > scanned_at:
+        if not _current_entry(entry) or entry.get('scanned_at', 0) > scanned_at:
             return
         item = next((c for c in entry['children']
                      if c.get('isDir') and _cache_key(c['path']) == child), None)

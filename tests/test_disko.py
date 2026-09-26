@@ -932,12 +932,16 @@ class TestCacheStaleness(TempTreeMixin, unittest.TestCase):
                         scanned_at=200.0)
         self.assertEqual(disko.cache_get(self.root)['children'][0]['size'], 10)
 
-    def test_ancestor_touched_by_propagation_still_treated_as_miss(self):
+    def test_ancestor_skipped_by_propagation_still_treated_as_miss(self):
         # Seed an old-format (no 'version' key) ancestor entry, then trigger cache_set on
-        # a descendant so _propagate_size touches the ancestor's children/size in place.
-        # _propagate_size deliberately never stamps 'version' on an entry it only touches
-        # via propagation (its OWN children may still be old-shaped), so the ancestor must
-        # still read as a miss afterward -- proving that non-stamping behavior end-to-end.
+        # a descendant. _propagate_size now stops at the first non-current-version
+        # ancestor (_current_entry) rather than updating its raw data in place: an entry
+        # that's already a guaranteed cache_get miss regardless is about to be discarded
+        # on its own next real scan, so writing into it gains nothing (and, per the
+        # review that prompted this, could otherwise let a stale/future scanned_at on
+        # such an entry silently block a fresh scan's cache_set from ever replacing it --
+        # see test_future_dated_old_version_entry_is_replaced_by_next_scan). The old
+        # entry's own size must therefore stay exactly as seeded, untouched.
         big = os.path.join(self.root, 'big')
         with disko._cache_lock:
             disko._cache[disko._cache_key(self.root)] = {
@@ -948,8 +952,23 @@ class TestCacheStaleness(TempTreeMixin, unittest.TestCase):
                         scanned_at=200.0)
         with disko._cache_lock:
             raw = disko._cache[disko._cache_key(self.root)]
-        self.assertEqual(raw['children'][0]['size'], 99)  # propagation did touch it (raw access)
-        self.assertIsNone(disko.cache_get(self.root))  # but it's still unversioned: a miss
+        self.assertEqual(raw['children'][0]['size'], 10)  # left untouched, not propagated into
+        self.assertIsNone(disko.cache_get(self.root))  # still unversioned: a miss
+
+    def test_future_dated_old_version_entry_is_replaced_by_next_scan(self):
+        # An old-version (or unversioned) entry with a scanned_at that happens to be
+        # LATER than a fresh scan's start time (e.g. after a clock rollback, or simply a
+        # hand-edited cache) must not block that fresh scan from replacing it -- only a
+        # CURRENT-version entry's timestamp should ever win a "newer scan" race, since an
+        # old-version entry is already being migrated away, not legitimately competing.
+        with disko._cache_lock:
+            disko._cache[disko._cache_key(self.root)] = {
+                'children': [], 'scanned_at': time.time() + 3600,  # "from the future"
+            }
+        self.assertTrue(disko.cache_set(self.root, [], scanned_at=time.time()))
+        entry = disko.cache_get(self.root)
+        self.assertIsNotNone(entry)  # replaced and now a normal, current-version hit
+        self.assertEqual(entry['version'], disko.CACHE_VERSION)
 
     def test_propagation_skips_corrupted_ancestor(self):
         # A malformed ancestor entry (e.g. a hand-edited or foreign cache file --
