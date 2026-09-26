@@ -483,6 +483,14 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
                                                'size': 1, 'isDir': True}], scanned_at=200.0))
         self.assertIsNone(disko.cache_get(self.root))  # still malformed: a miss, not stale data
 
+    def test_non_finite_child_size_treated_as_miss(self):
+        # A structurally/type-complete child whose 'size' is inf/NaN wouldn't crash
+        # _size_key's sort or the size-summing reduce, but would silently poison the
+        # ancestor's total (NaN/inf propagating upward) -- reject it outright instead.
+        for bad_size in (float('inf'), float('-inf'), float('nan')):
+            self.assertFalse(disko._sound_child(
+                {'name': 'x', 'path': '/x', 'size': bad_size, 'isDir': True}), bad_size)
+
     def test_non_dict_cache_entry_treated_as_miss(self):
         # A genuinely non-dict, non-None, truthy value: None alone would already be
         # caught by cache_get's earlier "not a sound entry" check without ever

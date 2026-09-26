@@ -105,14 +105,17 @@ def _sound_child(c) -> bool:
     reader assumes its type without checking: _propagate_size passes an isDir-truthy
     child's 'path' straight into _cache_key -> os.path.expanduser (TypeError on non-str,
     e.g. None), and both _size_key's sort and _propagate_size's own size-summing negate/
-    add every child's 'size' (TypeError on a non-numeric value) -- 'size' is None for a
-    du failure/timeout in the real app, never any other non-number."""
-    return (isinstance(c, dict)
-            and isinstance(c.get('name'), str)
+    add every child's 'size' -- TypeError on a non-numeric value, and a silently wrong
+    (NaN/inf-poisoned) ancestor total from a non-finite one. 'size' is None for a du
+    failure/timeout in the real app, never any other non-number."""
+    if not isinstance(c, dict):
+        return False
+    size = c.get('size')
+    return (isinstance(c.get('name'), str)
             and isinstance(c.get('path'), str)
             and isinstance(c.get('isDir'), bool)
-            and (c.get('size') is None
-                 or (isinstance(c.get('size'), (int, float)) and not isinstance(c.get('size'), bool))))
+            and (size is None
+                 or (isinstance(size, (int, float)) and not isinstance(size, bool) and math.isfinite(size))))
 
 
 def _sound_entry(entry) -> bool:
