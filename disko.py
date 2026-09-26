@@ -710,7 +710,7 @@ def stream_directory(path: str, write_event, force: bool = False, stop=None):
             'scanned_at': cached['scanned_at'],
         })
         for child in cached['children']:
-            write_event({'type': 'child', **child})
+            write_event({**child, 'type': 'child'})
 
         if time.time() - cached['scanned_at'] < CACHE_TTL:
             write_event({'type': 'done'})
@@ -737,7 +737,7 @@ def stream_directory(path: str, write_event, force: bool = False, stop=None):
             'scanned_at': fresh['scanned_at'],
         })
         for child in fresh['children']:
-            write_event({'type': 'child', **child})
+            write_event({**child, 'type': 'child'})
         write_event({'type': 'done'})
         return
 
@@ -772,7 +772,7 @@ def stream_directory(path: str, write_event, force: bool = False, stop=None):
                     write_event(None)  # heartbeat: detects a disconnected client
                     continue
                 collected.append(child)
-                write_event({'type': 'child', **child})
+                write_event({**child, 'type': 'child'})
         finally:
             children.close()  # cancels queued du calls if we bail out early
     if stop.is_set():
