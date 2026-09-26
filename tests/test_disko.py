@@ -590,6 +590,41 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
         self.assertFalse(disko._sound_child(
             {'name': 'x', 'path': '/x', 'size': 1, 'isDir': True, 'status': {}}))
 
+    def test_impossible_field_combinations_rejected(self):
+        # The three real shapes (du'ed directory / mount / file-type bucket) are
+        # mutually exclusive, so fields must be validated together, not independently.
+        # A directory claiming a fileType (impossible in the real app -- fileType is
+        # only ever set on isDir:False bucket children) would make the frontend
+        # legend/filter/coloring treat a real subfolder as a typed loose file.
+        self.assertFalse(disko._sound_child(
+            {'name': 'photos', 'path': '/photos', 'size': 100, 'isDir': True, 'fileType': 'image'}))
+        # A non-directory bucket child missing 'fileType' would recreate the pre-v2
+        # untyped '(loose files)' behaviour despite carrying version: 2.
+        self.assertFalse(disko._sound_child({'name': 'x', 'path': '/x', 'size': 1, 'isDir': False}))
+        # A mount is always a directory; _mount_child never pairs 'mount' with a
+        # non-directory, a 'fileType', or a 'status'.
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': None, 'isDir': False, 'mount': True}))
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 0, 'isDir': True, 'mount': True, 'fileType': 'image'}))
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 0, 'isDir': True, 'mount': True, 'status': 'partial'}))
+
+    def test_cached_impossible_combination_is_a_full_cache_miss(self):
+        # End-to-end: a typed directory or an untyped bucket child in a stored cache
+        # entry must make cache_get (and therefore a cache-hit stream) reject the
+        # whole entry as a miss, not just fail an isolated _sound_child unit check.
+        typed_dir = os.path.join(self.root, 'photos')
+        self.assertTrue(disko.cache_set(self.root, [
+            {'name': 'photos', 'path': typed_dir, 'size': 100, 'isDir': True, 'fileType': 'image'},
+        ], scanned_at=time.time()))
+        self.assertIsNone(disko.cache_get(self.root))
+
+        self.assertTrue(disko.cache_set(self.root, [
+            {'name': 'x', 'path': os.path.join(self.root, 'x'), 'size': 1, 'isDir': False},
+        ], scanned_at=time.time()))
+        self.assertIsNone(disko.cache_get(self.root))
+
     def test_frontend_reserved_or_unknown_key_rejected(self):
         # A cached child's 'children' key isn't just an inert extra field: D3 treats
         # it as a nested hierarchy level (see renderTreemap's d3.hierarchy() call),
@@ -605,9 +640,13 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
         # must be rejected too, not merely overridden at the writer.
         self.assertFalse(disko._sound_child(
             {'name': 'x', 'path': '/x', 'size': 1, 'isDir': False, 'type': 'done'}))
+        # Each known field in its proper (discriminated) shape must still be accepted.
         self.assertTrue(disko._sound_child(
-            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': True,
-             'fileType': 'image', 'status': 'partial', 'mount': True}))
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': True, 'status': 'partial'}))
+        self.assertTrue(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': False, 'fileType': 'image'}))
+        self.assertTrue(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 0, 'isDir': True, 'mount': True}))
 
     def test_non_finite_value_under_unknown_key_rejected(self):
         # _json_safe is a general backstop: a non-finite float under a field this
@@ -1012,7 +1051,7 @@ class TestCacheStaleness(TempTreeMixin, unittest.TestCase):
         ]
         disko.cache_set(self.root, root_children, scanned_at=100.0)
         disko.cache_set(big, [{'name': 'nested', 'path': nested, 'size': 5, 'isDir': True},
-                              {'name': '(loose files)', 'path': big, 'size': 5, 'isDir': False}],
+                              {'name': '(other)', 'path': big, 'size': 5, 'isDir': False, 'fileType': 'other'}],
                         scanned_at=100.0)
         held = disko.cache_get(self.root)['children']  # a stream may be iterating this list
         disko.cache_set(nested, [{'name': 'deep', 'path': os.path.join(nested, 'deep'), 'size': 95,

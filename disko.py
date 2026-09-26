@@ -145,43 +145,56 @@ _KNOWN_CHILD_KEYS = frozenset({'name', 'path', 'size', 'isDir', 'fileType', 'sta
 
 
 def _sound_child(c) -> bool:
-    """True if c has the fields/types every child dict the app itself ever writes always
-    has (name/path/size/isDir, all as the app's own types -- see _dir_child, _mount_child,
-    _iter_children's bucket dicts). Every required field here is checked because a
-    downstream reader assumes its type without checking: _propagate_size passes an
-    isDir-truthy child's 'path' straight into _cache_key -> os.path.expanduser (TypeError
-    on non-str, e.g. None), and both _size_key's sort and _propagate_size's own
-    size-summing negate/add every child's 'size' -- TypeError on a non-numeric value, and
-    a silently wrong (NaN/inf-poisoned, or negative -- no allocated size the app itself
-    produces is ever negative) ancestor total otherwise. 'size' is None for a du
-    failure/timeout in the real app, never any other non-number. The optional fields
-    (fileType/status/mount) are constrained to the exact values the app itself ever
-    writes, per _dir_child/_mount_child/_iter_children's bucket dicts. Any key outside
-    _KNOWN_CHILD_KEYS is rejected outright -- write_event() spreads a cached child
-    straight into the SSE event and renderTreemap() feeds it straight to d3.hierarchy(),
-    so an extra key isn't just inert: it can collide with a protocol field (as 'type'
-    did) or a D3-meaningful one (like 'children', which D3 would treat as a nested,
-    unvalidated hierarchy level). _json_safe is checked over every value in the whole
-    dict as a final backstop, so a non-finite value under any of the known keys still
-    can't break the SSE JSON boundary (json.dumps(..., allow_nan=False) in do_GET's
-    write_event)."""
+    """True if c is one of the exact discriminated shapes the app itself ever writes:
+    a du'ed directory (_dir_child: isDir True, never fileType, optional 'status'), a
+    mount point (_mount_child: isDir True, mount True, never fileType/status), or a
+    file-type bucket (_iter_children's bucket dicts: isDir False, a required valid
+    fileType, never status/mount). These three shapes are mutually exclusive in the
+    real app, so they're validated together rather than as independent optional
+    fields: a directory with a 'fileType' (impossible in practice) would otherwise
+    pass and make the frontend legend/filter/coloring treat a real subfolder as a
+    typed loose file, and a bucket child missing 'fileType' would recreate the
+    pre-v2 untyped '(loose files)' behaviour despite carrying version: 2.
+
+    Every required field is checked because a downstream reader assumes its type
+    without checking: _propagate_size passes an isDir-truthy child's 'path' straight
+    into _cache_key -> os.path.expanduser (TypeError on non-str, e.g. None), and both
+    _size_key's sort and _propagate_size's own size-summing negate/add every child's
+    'size' -- TypeError on a non-numeric value, and a silently wrong (NaN/inf-poisoned,
+    or negative -- no allocated size the app itself produces is ever negative) ancestor
+    total otherwise. 'size' is None for a du failure/timeout in the real app, never any
+    other non-number. Any key outside _KNOWN_CHILD_KEYS is rejected outright --
+    write_event() spreads a cached child straight into the SSE event and
+    renderTreemap() feeds it straight to d3.hierarchy(), so an extra key isn't just
+    inert: it can collide with a protocol field (as 'type' did) or a D3-meaningful one
+    (like 'children', which D3 would treat as a nested, unvalidated hierarchy level).
+    _json_safe is checked over every value as a final backstop against a non-finite
+    value breaking the SSE JSON boundary (json.dumps(..., allow_nan=False) in
+    do_GET's write_event)."""
     if not isinstance(c, dict):
         return False
     if not c.keys() <= _KNOWN_CHILD_KEYS:
         return False
+    if not (isinstance(c.get('name'), str) and isinstance(c.get('path'), str)
+            and isinstance(c.get('isDir'), bool)):
+        return False
     size = c.get('size')
+    if not (size is None or (_finite_number(size) and size >= 0)):
+        return False
+    if not all(_json_safe(v) for v in c.values()):
+        return False
     file_type = c.get('fileType')
     status = c.get('status')
     mount = c.get('mount')
-    return (isinstance(c.get('name'), str)
-            and isinstance(c.get('path'), str)
-            and isinstance(c.get('isDir'), bool)
-            and (size is None or (_finite_number(size) and size >= 0))
-            and (file_type is None
-                 or (isinstance(file_type, str) and (file_type in FILE_TYPE_EXTENSIONS or file_type == 'other')))
-            and (status is None or (isinstance(status, str) and status in _KNOWN_CHILD_STATUSES))
-            and (mount is None or isinstance(mount, bool))
-            and all(_json_safe(v) for v in c.values()))
+    if not c['isDir']:
+        # Bucket child: fileType is required (not optional) and never status/mount.
+        return (mount is None and status is None
+                and isinstance(file_type, str) and (file_type in FILE_TYPE_EXTENSIONS or file_type == 'other'))
+    if mount is not None:
+        # Mount point: mount is always exactly True, never paired with fileType/status.
+        return mount is True and file_type is None and status is None
+    # Ordinary du'ed directory: never fileType; status is optional and constrained.
+    return file_type is None and (status is None or (isinstance(status, str) and status in _KNOWN_CHILD_STATUSES))
 
 
 def _sound_entry(entry) -> bool:
