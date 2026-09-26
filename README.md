@@ -100,7 +100,7 @@ python3 disko.py --path /data --no-browser
 
 The cache stores one entry per scanned folder (including prefetched folders). Entries are keyed by absolute, normalized path (`~`, `..` and trailing slashes resolve to the same entry) and hold the folder's immediate children with their sizes, plus a `scanned_at` timestamp recording when the scan started, which the UI shows as the scan time.
 
-Cached results are shown instantly. If an entry is older than `CACHE_TTL` (5 minutes by default), disko keeps the connection open, rescans the folder in the background, and swaps in the fresh results when the rescan finishes. When a folder is rescanned, its new size is also written into the cached entries of its parent folders. A scan never overwrites an entry written by a scan that started later.
+Cached results are shown instantly. If an entry is older than 5 minutes (the `CACHE_TTL` constant in `disko.py`), disko keeps the connection open, rescans the folder in the background, and swaps in the fresh results when the rescan finishes. When a folder is rescanned, its new size is also written into the cached entries of its parent folders. A scan never overwrites an entry written by a scan that started later.
 
 ---
 
