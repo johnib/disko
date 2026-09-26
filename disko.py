@@ -707,6 +707,8 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid #e94560; out
 .cell rect { stroke: #111318; stroke-width: 1.5px; transition: opacity .1s; }
 .cell:hover rect { opacity: .8; stroke-width: 0; }
 .cell.file { cursor: default; }
+.cell:focus { outline: none; }
+.cell:focus-visible rect { stroke: #f8fafc; stroke-width: 2.5px; opacity: 1; }
 .cell text { pointer-events: none; }
 .cell.partial rect { stroke: #cbd5e1; stroke-dasharray: 4 3; }
 .cell.unknown rect { fill: #334155; stroke: #64748b; stroke-dasharray: 4 3; }
@@ -860,7 +862,7 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid #e94560; out
 
 <div id="body">
   <div id="treemap-wrap">
-    <svg id="treemap" role="img" aria-label="Treemap of folder contents by size"></svg>
+    <svg id="treemap" role="group" aria-label="Treemap of folder contents by size"></svg>
     <div id="empty-state">This folder is empty</div>
     <div id="loading-overlay" role="status" aria-live="polite">
       <div class="loading-spinner"></div>
@@ -1415,6 +1417,23 @@ function renderTreemap(data) {
     .on('mouseleave',()=>{ tooltip.style.display='none'; })
     .on('click',(_,d)=>{ if(d.data.isDir===false)return; tooltip.style.display='none'; goTo(d.data.path); });
 
+  // Keyboard access: folder cells are focusable buttons (Tab, then Enter/Space opens).
+  cell.filter(d => d.data.isDir !== false)
+    .attr('tabindex', 0)
+    .attr('role', 'button')
+    .attr('aria-label', d => `Open ${d.data.name}, ${sizeLabel(d.data)}`)
+    .on('focus', function(_, d) {
+      const r = this.getBoundingClientRect();
+      showTooltip(d, totalVal, r.left + r.width / 2, r.top + r.height / 2);
+    })
+    .on('blur', () => { tooltip.style.display='none'; })
+    .on('keydown', (ev, d) => {
+      if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      ev.preventDefault();
+      tooltip.style.display='none';
+      goTo(d.data.path);
+    });
+
   refreshTooltip(totalVal);
 }
 
@@ -1571,17 +1590,31 @@ class Handler(BaseHTTPRequestHandler):
                 write_event({'type': 'error', 'error': 'Scan failed: %s' % (e or type(e).__name__)})
 
         elif parsed.path == '/invalidate':
+            self.send_response(405)  # state-changing: POST only
+            self.send_header('Allow', 'POST')
+            self.end_headers()
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if not self._allowed():
+            self.send_error(403)
+            return
+
+        parsed = urlparse(self.path)
+        if parsed.path == '/invalidate':
             params = parse_qs(parsed.query, errors='surrogateescape')
             path = params.get('path', [''])[0]
             if path:
                 # Same resolution as stream_directory, so '/' on macOS clears the Data volume entry.
                 cache_delete(_resolve_scan_path(path))
             self.send_response(200)
-            self.end_headers()
-
         else:
             self.send_response(404)
-            self.end_headers()
+        self.send_header('Content-Length', '0')
+        self.end_headers()
 
     def log_message(self, format, *args):
         if _verbose:
@@ -1614,7 +1647,7 @@ def main():
         _default_path = os.path.expanduser("~")
     port = args.port
     try:
-        server = Server(("localhost", port), Handler)
+        server = Server(("127.0.0.1", port), Handler)
     except OSError as e:
         if e.errno == errno.EADDRINUSE:
             print(f"  Error: port {port} is already in use (another disko instance?).\n"

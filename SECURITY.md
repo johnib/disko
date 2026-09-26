@@ -34,6 +34,8 @@ disko is designed with the following security properties:
   rebinding), and rejects cross-site requests based on the `Origin` and
   `Sec-Fetch-Site` headers (preventing CSRF-style scans or cache clearing and
   cross-origin reads of directory listings). Such requests get `403 Forbidden`.
+  The only state-changing endpoint (`/invalidate`, which drops a cache entry)
+  accepts `POST` only, so it can't be triggered by a plain link or `<img>` tag.
 - **No sensitive file contents** — the persistent cache stores only directory
   paths and size metadata. File contents are never read or stored.
 - **No outbound requests** — disko makes no outbound network requests except to

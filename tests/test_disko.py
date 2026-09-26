@@ -621,10 +621,10 @@ class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
         disko._default_path = self._orig_default
         super(TestHTTPSmoke, self).tearDown()
 
-    def _get(self, path, headers=None):
+    def _get(self, path, headers=None, method='GET'):
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
         try:
-            conn.request('GET', path, headers=headers or {})
+            conn.request(method, path, headers=headers or {})
             resp = conn.getresponse()
             return resp.status, resp.getheader('Content-Type', ''), resp.read()
         finally:
@@ -693,6 +693,17 @@ class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
     def test_unknown_path_404(self):
         status, _, _ = self._get('/nope')
         self.assertEqual(status, 404)
+
+    def test_invalidate_is_post_only(self):
+        from urllib.parse import quote
+        disko.cache_set(self.root, [], scanned_at=time.time())
+        url = '/invalidate?path=' + quote(self.root)
+        self.assertEqual(self._get(url)[0], 405)
+        self.assertIsNotNone(disko.cache_get(self.root))
+        self.assertEqual(self._get(url, {'Origin': 'https://evil.example'}, method='POST')[0], 403)
+        self.assertIsNotNone(disko.cache_get(self.root))
+        self.assertEqual(self._get(url, method='POST')[0], 200)
+        self.assertIsNone(disko.cache_get(self.root))
 
     def test_foreign_host_rejected(self):
         # DNS-rebinding protection: only loopback Host headers are served.

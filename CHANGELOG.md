@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Pinned D3** — D3 is loaded as version 7.9.0 with Subresource Integrity; if it fails to load, an overlay explains why instead of a blank page.
 - **Cache file** — written atomically (temp file + rename) with mode `0600`, never through a symlink, and never saved when running as root.
 - **Private vulnerability reporting** — `SECURITY.md` points to GitHub's private reporting.
+- **`/invalidate` is POST-only** — the one state-changing endpoint can no longer be triggered by a link or `<img>` tag; the server binds explicitly to `127.0.0.1`.
 
 ### Added
 
@@ -40,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Frontend stream lifecycle** — Back, errors and the path bar no longer leave stale streams updating the view.
 - **Render batching** — stream events are rendered at most once per animation frame, and the treemap caps the number of cells, so large folders stay responsive.
 - **Per-row refresh** — refreshing a folder row shows a spinner (or a failure state) and updates that row's size in the current view.
-- **Accessibility** — folder rows and the refresh button are real buttons with labels, visible keyboard focus, breadcrumb `aria-current`, and better contrast.
+- **Accessibility** — treemap folder cells and sidebar folder rows are keyboard-focusable buttons (Enter/Space opens) with labels, the refresh button is a real button, visible keyboard focus, breadcrumb `aria-current`, and better contrast.
 - **macOS root** — asking for `/` scans the Data volume but keeps `/` as the displayed path, so the breadcrumb and Up button treat it as the root.
 
 ## [1.0.0] - 2026-06-28
