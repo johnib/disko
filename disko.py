@@ -220,7 +220,8 @@ def stream_directory(path: str, write_event, force: bool = False):
         'type': 'start',
         'path': path,
         'name': os.path.basename(path) or path,
-        'total_dirs': len(dirs),
+        # +1 for the "(loose files)" entry sent after the dirs, so progress never exceeds 100%
+        'total_dirs': len(dirs) + (1 if file_total > 0 else 0),
         'from_cache': False,
     })
 
@@ -274,15 +275,16 @@ body {
 #app-title { font-size: 14px; font-weight: 700; color: #f1f5f9; white-space: nowrap; }
 #breadcrumb { display: flex; align-items: center; flex: 1; gap: 2px; overflow: hidden; min-width: 0; }
 .crumb {
-  font-size: 12px; color: #64748b; cursor: pointer;
+  font: inherit; font-size: 12px; color: #94a3b8; cursor: pointer;
+  background: transparent; border: none;
   padding: 3px 6px; border-radius: 4px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px;
-  transition: all .15s;
+  min-width: 24px; flex-shrink: 1; transition: all .15s;
 }
 .crumb:hover { background: #1e2535; color: #cbd5e1; }
-.crumb.active { color: #f1f5f9; font-weight: 500; cursor: default; }
+.crumb.active { color: #f1f5f9; font-weight: 500; cursor: default; flex-shrink: 0; }
 .crumb.active:hover { background: transparent; }
-.crumb-sep { color: #2d3748; font-size: 13px; flex-shrink: 0; }
+.crumb-sep { color: #8391a7; font-size: 13px; flex-shrink: 0; }
 
 #header-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 #path-form { display: flex; }
@@ -292,7 +294,7 @@ body {
   outline: none; width: 230px; font-family: 'SF Mono', monospace; transition: border-color .15s;
 }
 #path-input:focus { border-color: #e94560; color: #f1f5f9; }
-#total-size { font-size: 12px; color: #64748b; white-space: nowrap; }
+#total-size { font-size: 12px; color: #94a3b8; white-space: nowrap; }
 #total-size span { color: #e94560; font-weight: 700; }
 
 .hdr-btn {
@@ -301,6 +303,13 @@ body {
   cursor: pointer; transition: all .15s; white-space: nowrap;
 }
 .hdr-btn:hover { background: #2d3748; color: #f1f5f9; }
+.hdr-btn:disabled { opacity: .5; cursor: default; }
+.hdr-btn:disabled:hover { background: #1e2535; color: #94a3b8; }
+button:focus-visible, [tabindex]:focus-visible { outline: 2px solid #e94560; outline-offset: 1px; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+}
 #back-btn { display: none; }
 #back-btn.visible { display: block; }
 #refresh-btn.spinning { animation: spin .7s linear infinite; }
@@ -329,13 +338,13 @@ body {
   border-left: 1px solid #1e2535; display: flex; flex-direction: column; overflow: hidden;
 }
 #sidebar-header {
-  padding: 10px 16px 9px; font-size: 11px; font-weight: 600; color: #475569;
+  padding: 10px 16px 9px; font-size: 11px; font-weight: 600; color: #8391a7;
   text-transform: uppercase; letter-spacing: .8px; border-bottom: 1px solid #1e2535;
   display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; gap: 6px;
 }
 #scan-badge {
   display: flex; align-items: center; gap: 5px;
-  font-size: 10px; color: #64748b; font-weight: 400; letter-spacing: 0;
+  font-size: 10px; color: #94a3b8; font-weight: 400; letter-spacing: 0;
 }
 .scan-dot {
   width: 6px; height: 6px; border-radius: 50%; background: #e94560;
@@ -345,7 +354,7 @@ body {
 @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.3;transform:scale(.65)} }
 
 #cache-badge {
-  font-size: 10px; color: #334155; padding: 2px 6px; border-radius: 4px;
+  font-size: 10px; color: #8391a7; padding: 2px 6px; border-radius: 4px;
   background: #1e2535; border: 1px solid #2d3748; white-space: nowrap; display: none;
 }
 #cache-badge.show { display: block; }
@@ -355,27 +364,35 @@ body {
 #sidebar-list::-webkit-scrollbar-thumb { background: #2d3748; border-radius: 2px; }
 
 .sitem {
-  display: flex; flex-direction: column; padding: 8px 16px 7px;
-  border-bottom: 1px solid #1a2030; cursor: pointer; transition: background .1s; gap: 4px;
+  display: flex; align-items: center; gap: 3px; padding-right: 10px;
+  border-bottom: 1px solid #1a2030; transition: background .1s;
   animation: fadeSlide .18s ease-out both;
+}
+.sitem-main {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px;
+  padding: 8px 6px 7px 16px; font: inherit; color: inherit; text-align: left;
+  background: transparent; border: none; cursor: pointer;
 }
 @keyframes fadeSlide { from{opacity:0;transform:translateX(8px)} to{opacity:1;transform:translateX(0)} }
 .sitem:hover { background: #1e2535; }
-.sitem.file { cursor: default; }
+.sitem.file .sitem-main { cursor: default; }
 .sitem-top { display: flex; align-items: center; gap: 7px; }
 .sitem-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .sitem-name { flex: 1; font-size: 12px; color: #cbd5e1;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sitem-size { font-size: 11px; color: #64748b; white-space: nowrap; }
+.sitem-size { font-size: 11px; color: #94a3b8; white-space: nowrap; }
 .sitem-actions { display: flex; align-items: center; gap: 3px; opacity: 0; transition: opacity .15s; }
-.sitem:hover .sitem-actions { opacity: 1; }
+.sitem:hover .sitem-actions, .sitem:focus-within .sitem-actions { opacity: 1; }
+@media (hover: none) { .sitem-actions { opacity: 1; } }
 .sitem-cached { font-size: 9px; color: #1d4ed8; background: #1e3a5f; padding: 1px 4px; border-radius: 3px; }
 .sitem-refresh-btn {
   font-size: 11px; padding: 1px 5px; border-radius: 3px; cursor: pointer;
-  color: #475569; background: transparent; border: none;
+  color: #94a3b8; background: transparent; border: none;
   transition: all .15s; line-height: 1.4;
 }
-.sitem-refresh-btn:hover { background: #2d3748; color: #e94560; }
+.sitem-refresh-btn:hover { background: #2d3748; color: #f47a8f; }
+.sitem-refresh-btn.spinning { animation: spin .7s linear infinite; color: #f47a8f; cursor: progress; }
+.sitem-refresh-btn.failed { color: #f47a8f; }
 .sitem-bar-wrap { height: 2px; background: #1e2535; border-radius: 1px; margin-left: 15px; width: calc(100% - 15px); }
 .sitem-bar { height: 100%; border-radius: 1px; opacity: .45; }
 
@@ -387,7 +404,15 @@ body {
 }
 #error-overlay.show { display: flex; }
 #error-title { color: #e94560; font-size: 15px; font-weight: 600; }
-#error-detail { color: #475569; font-size: 12px; }
+#error-detail { color: #94a3b8; font-size: 12px; }
+
+/* ── Empty state ── */
+#empty-state {
+  position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+  color: #94a3b8; font-size: 13px; pointer-events: none;
+}
+#empty-state.show { display: flex; }
+.sidebar-empty { padding: 14px 16px; font-size: 12px; color: #94a3b8; }
 
 /* ── Tooltip ── */
 #tooltip {
@@ -396,25 +421,39 @@ body {
   display: none; box-shadow: 0 8px 32px rgba(0,0,0,.5); max-width: 300px;
 }
 .tt-name { font-weight: 600; color: #f1f5f9; margin-bottom: 3px; word-break: break-word; }
-.tt-path { font-size: 11px; color: #475569; margin-bottom: 8px; word-break: break-all; }
-.tt-size { font-size: 18px; font-weight: 700; color: #e94560; }
-.tt-pct  { font-size: 11px; color: #64748b; margin-top: 2px; }
+.tt-path { font-size: 11px; color: #8391a7; margin-bottom: 8px; word-break: break-all; }
+.tt-size { font-size: 18px; font-weight: 700; color: #f26b83; }
+.tt-pct  { font-size: 11px; color: #94a3b8; margin-top: 2px; }
 .tt-cached { font-size: 10px; color: #334155; margin-top: 4px; }
-.tt-hint { margin-top: 8px; font-size: 11px; color: #334155; border-top: 1px solid #2d3748; padding-top: 7px; }
+.tt-hint { margin-top: 8px; font-size: 11px; color: #8391a7; border-top: 1px solid #2d3748; padding-top: 7px; }
+
+/* ── Narrow windows ── */
+@media (max-width: 760px) {
+  #header { flex-wrap: wrap; height: auto; padding: 6px 10px; gap: 6px 10px; }
+  #app-title { display: none; }
+  #breadcrumb { order: 3; flex-basis: 100%; }
+  #header-right { flex: 1; justify-content: flex-end; flex-wrap: wrap; min-width: 0; }
+  #path-form { flex: 1; min-width: 120px; }
+  #path-input { width: 100%; }
+  #body { flex-direction: column; }
+  #treemap-wrap { flex: 1 1 55%; min-height: 160px; }
+  #sidebar { width: auto; flex: 1 1 45%; min-height: 0; border-left: none; border-top: 1px solid #1e2535; }
+}
 </style>
 </head>
 <body>
 
 <div id="header">
-  <span id="logo">🗂</span>
+  <span id="logo" aria-hidden="true">🗂</span>
   <span id="app-title">Disk Explorer</span>
-  <div id="breadcrumb"></div>
+  <nav id="breadcrumb" aria-label="Current path"></nav>
   <div id="header-right">
-    <form id="path-form"><input id="path-input" type="text"
-      placeholder="Jump to path…" spellcheck="false" autocomplete="off"/></form>
+    <form id="path-form" role="search"><label for="path-input" class="sr-only">Jump to path</label><input
+      id="path-input" type="text" placeholder="Jump to path…" spellcheck="false" autocomplete="off"/></form>
     <div id="total-size">Size: <span>—</span></div>
+    <button class="hdr-btn" id="up-btn" title="Go to parent folder" aria-label="Go to parent folder">↑ Up</button>
     <button class="hdr-btn" id="refresh-btn" title="Refresh current folder">↺ Refresh</button>
-    <button class="hdr-btn" id="back-btn">← Back</button>
+    <button class="hdr-btn" id="back-btn" title="Back (Backspace or Left arrow)">← Back</button>
   </div>
 </div>
 
@@ -422,8 +461,9 @@ body {
 
 <div id="body">
   <div id="treemap-wrap">
-    <svg id="treemap"></svg>
-    <div id="error-overlay">
+    <svg id="treemap" role="img" aria-label="Treemap of folder contents by size"></svg>
+    <div id="empty-state">This folder is empty</div>
+    <div id="error-overlay" role="alert">
       <div id="error-title">⚠ Could not scan</div>
       <div id="error-detail"></div>
     </div>
@@ -433,7 +473,7 @@ body {
       <span>Contents</span>
       <div style="display:flex;align-items:center;gap:6px">
         <span id="cache-badge"></span>
-        <span id="scan-badge">
+        <span id="scan-badge" role="status">
           <span class="scan-dot" id="scan-dot"></span>
           <span id="scan-text"></span>
         </span>
@@ -456,20 +496,30 @@ const PALETTE = [
 let navStack = [];
 let currentData = null;
 let activeES = null;
+const refreshingPaths = new Set();  // per-row refreshes in flight
+let lastMouse = null;               // last pointer position over the treemap (for live tooltip)
 
 function fmt(b) {
   if (!b || b <= 0) return '0 B';
   const u = ['B','KB','MB','GB','TB'];
-  const i = Math.min(4, Math.floor(Math.log(b) / Math.log(1024)));
-  const v = b / Math.pow(1024, i);
-  return (i >= 2 ? v.toFixed(1) : Math.round(v)) + ' ' + u[i];
+  let i = Math.min(4, Math.floor(Math.log(b) / Math.log(1024)));
+  const shown = k => { const v = b / Math.pow(1024, k); return k >= 2 ? v.toFixed(1) : String(Math.round(v)); };
+  // Roll over to the next unit when rounding reaches 1024 (e.g. never show "1024.0 MB")
+  if (i < 4 && Number(shown(i)) >= 1024) i++;
+  return shown(i) + ' ' + u[i];
 }
 function pctOf(a, b) { return b ? ((a/b)*100).toFixed(1)+'%' : '—'; }
 function timeAgo(ts) {
-  const s = Math.round(Date.now()/1000 - ts);
+  const s = Math.max(0, Math.round(Date.now()/1000 - ts));
   if (s < 60)  return `${s}s ago`;
-  if (s < 3600) return `${Math.round(s/60)}m ago`;
-  return `${Math.round(s/3600)}h ago`;
+  if (s < 3600) return `${Math.floor(s/60)}m ago`;
+  if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+  return `${Math.floor(s/86400)}d ago`;
+}
+function parentOf(p) {
+  const t = (p || '').replace(/\/+$/, '');
+  const i = t.lastIndexOf('/');
+  return i <= 0 ? '/' : t.slice(0, i);
 }
 
 // ── Streaming ────────────────────────────────────────────────
@@ -512,10 +562,11 @@ function navigate(path, force) {
       items.splice(lo, 0, item);
       const total = items.reduce((s,i) => s+i.size, 0);
       renderData({ path: meta.path, name: meta.name, size: total, children: [...items] });
-      if (totalDirs > 0) setProgress(Math.round((received/totalDirs)*100));
+      if (totalDirs > 0) setProgress(Math.min(100, Math.round((received/totalDirs)*100)));
       setScanStatus(`${received} / ${totalDirs}`, false);
     },
     onDone() {
+      if (currentData) { currentData.done = true; updateEmptyState(currentData); }
       setProgress(100);
       setScanStatus('done ✓', true);
       setTimeout(() => { setProgress(-1); setScanStatus('', true); }, 1500);
@@ -547,8 +598,51 @@ function refreshCurrent(force=true) {
 function refreshPath(path) {
   // If this IS the current path, just refresh current
   if (currentData && currentData.path === path) { refreshCurrent(true); return; }
-  // Otherwise just invalidate cache silently (server handles it on next visit)
-  fetch(`${API}/invalidate?path=${encodeURIComponent(path)}`).catch(()=>{});
+  if (refreshingPaths.has(path)) return;
+  // Otherwise force a rescan of that folder (which also refreshes its cache entry),
+  // show a spinner on its row meanwhile, and update its size in the current view.
+  const parentPath = currentData ? currentData.path : null;
+  refreshingPaths.add(path);
+  setRowRefreshState(path, 'spinning');
+  let total = 0, finished = false;
+  const es = new EventSource(`${API}/stream?path=${encodeURIComponent(path)}&force=1`);
+  const finish = ok => {
+    if (finished) return;
+    finished = true;
+    es.close();
+    refreshingPaths.delete(path);
+    setRowRefreshState(path, ok ? '' : 'failed');
+    if (!ok || !currentData || currentData.path !== parentPath) return;
+    const item = (currentData.children || []).find(c => c.path === path && c.isDir !== false);
+    if (!item) return;
+    item.size = total;  // shared with the stream's item list, so later child events keep it
+    currentData.children.sort((a, b) => b.size - a.size);
+    currentData.size = currentData.children.reduce((s, c) => s + c.size, 0);
+    renderData(currentData);
+    if (currentData.done) updateEmptyState(currentData);
+  };
+  es.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'child') total += msg.size || 0;
+    if (msg.type === 'done') finish(true);
+    if (msg.type === 'error') finish(false);
+  };
+  es.onerror = () => finish(false);
+}
+
+function setRowRefreshState(path, state) {
+  document.querySelectorAll('#sidebar-list .sitem-refresh-btn').forEach(btn => {
+    if (btn.dataset.path !== path) return;
+    btn.classList.toggle('spinning', state === 'spinning');
+    btn.classList.toggle('failed', state === 'failed');
+    btn.setAttribute('aria-busy', state === 'spinning' ? 'true' : 'false');
+    btn.title = state === 'failed' ? 'Refresh failed; click to retry' : 'Refresh this folder';
+  });
+}
+
+function goUp() {
+  if (!currentData || !currentData.path || currentData.path === '/') return;
+  goTo(parentOf(currentData.path));
 }
 
 function goBack() {
@@ -575,8 +669,23 @@ function render(data) {
   renderBreadcrumb();
   renderTreemap(data);
   renderSidebar(data);
+  updateEmptyState(data);
   document.getElementById('back-btn').classList.toggle('visible', navStack.length > 0);
+  document.getElementById('up-btn').disabled = !data.path || data.path === '/';
   document.querySelector('#total-size span').textContent = fmt(data.size);
+}
+
+// "Empty" is only known once the scan finished (data.done); hide it while children stream in.
+function updateEmptyState(data) {
+  const empty = !!data.done && !(data.children || []).some(c => c.size > 0);
+  document.getElementById('empty-state').classList.toggle('show', empty);
+  if (!empty) return;
+  const list = document.getElementById('sidebar-list');
+  list.textContent = '';
+  const msg = document.createElement('div');
+  msg.className = 'sidebar-empty';
+  msg.textContent = 'No items';
+  list.appendChild(msg);
 }
 
 // Partial update (during streaming) - skip nav stack update
@@ -593,20 +702,28 @@ function renderFull(data) {
   document.getElementById('back-btn').classList.toggle('visible', navStack.length > 0);
 }
 
+// Crumbs are derived from the current path itself (not click history), so every
+// ancestor up to "/" is reachable.
 function renderBreadcrumb() {
   const bc = document.getElementById('breadcrumb');
-  bc.innerHTML = '';
-  const chain = [...navStack, currentData].filter(Boolean);
+  bc.textContent = '';
+  if (!currentData || !currentData.path) return;
+  const parts = currentData.path.split('/').filter(Boolean);
+  const chain = [{ name: '/', path: '/' }];
+  parts.forEach((part, i) => chain.push({ name: part, path: '/' + parts.slice(0, i + 1).join('/') }));
   chain.forEach((item, i) => {
-    const name = item.name || (item.path||'').split('/').pop() || item.path;
-    const span = document.createElement('span');
-    span.className = 'crumb' + (i === chain.length-1 ? ' active' : '');
-    span.title = item.path;
-    span.textContent = name;
-    if (i < chain.length-1) span.onclick = () => { navStack = navStack.slice(0,i); renderFull(item); };
-    bc.appendChild(span);
-    if (i < chain.length-1) {
+    const last = i === chain.length-1;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'crumb' + (last ? ' active' : '');
+    btn.title = item.path;
+    btn.textContent = item.name;
+    if (last) btn.setAttribute('aria-current', 'page');
+    else btn.addEventListener('click', () => goTo(item.path));
+    bc.appendChild(btn);
+    if (!last && i > 0) {
       const sep = document.createElement('span'); sep.className='crumb-sep'; sep.textContent=' › ';
+      sep.setAttribute('aria-hidden', 'true');
       bc.appendChild(sep);
     }
   });
@@ -634,13 +751,58 @@ function hideCacheBadge() {
 }
 
 // ── Treemap ──────────────────────────────────────────────────
+// Pick black or white label text, whichever contrasts more with the cell fill (WCAG luminance).
+function labelColor(fill) {
+  const c = d3.rgb(fill);
+  const lin = v => { v /= 255; return v <= 0.03928 ? v/12.92 : Math.pow((v+0.055)/1.055, 2.4); };
+  const L = 0.2126*lin(c.r) + 0.7152*lin(c.g) + 0.0722*lin(c.b);
+  return (L + 0.05) / 0.05 >= 1.05 / (L + 0.05) ? '#000000' : '#ffffff';
+}
+
+function truncateLabel(name, max) {
+  const chars = Array.from(name);  // code points, so surrogate pairs are never split
+  return chars.length > max ? chars.slice(0, max-1).join('') + '…' : name;
+}
+
+function showTooltip(d, totalVal, x, y) {
+  const tooltip = document.getElementById('tooltip');
+  tooltip.textContent = '';
+  const line = (cls, txt) => {
+    const el = document.createElement('div'); el.className = cls; el.textContent = txt; tooltip.appendChild(el);
+  };
+  line('tt-name', d.data.name);
+  line('tt-path', d.data.path);
+  line('tt-size', fmt(d.data.size||d.value));
+  line('tt-pct', `${pctOf(d.data.size||d.value,totalVal)} of this view`);
+  if (d.data.isDir!==false) line('tt-hint', 'Click to drill down →');
+  tooltip.style.display='block';
+  // Keep the whole tooltip inside the viewport on both axes
+  const w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+  let left = x + 14, top = y - 10;
+  if (left + w > window.innerWidth - 8) left = x - w - 14;
+  if (top + h > window.innerHeight - 8) top = window.innerHeight - h - 8;
+  tooltip.style.left = Math.max(8, left) + 'px';
+  tooltip.style.top = Math.max(8, top) + 'px';
+}
+
+// After a re-render (e.g. while streaming) refresh the tooltip for whatever cell is now under the pointer.
+function refreshTooltip(totalVal) {
+  const tooltip = document.getElementById('tooltip');
+  if (tooltip.style.display !== 'block' || !lastMouse) return;
+  const el = document.elementFromPoint(lastMouse.x, lastMouse.y);
+  const g = el && el.closest ? el.closest('#treemap g.cell') : null;
+  if (!g) { tooltip.style.display='none'; return; }
+  showTooltip(d3.select(g).datum(), totalVal, lastMouse.x, lastMouse.y);
+}
+
 function renderTreemap(data) {
+  const tooltip = document.getElementById('tooltip');
   const wrap = document.getElementById('treemap-wrap');
-  const W = wrap.clientWidth-20, H = wrap.clientHeight-20;
+  const W = Math.max(0, wrap.clientWidth-20), H = Math.max(0, wrap.clientHeight-20);
   const svg = d3.select('#treemap').attr('width',W).attr('height',H);
   svg.selectAll('*').remove();
   const children = (data.children||[]).filter(c=>c.size>0);
-  if (!children.length) return;
+  if (!children.length) { tooltip.style.display='none'; return; }
 
   const root = d3.hierarchy({name:'root',children})
     .sum(d=>d.size||0).sort((a,b)=>b.value-a.value);
@@ -649,7 +811,6 @@ function renderTreemap(data) {
   const topKids = root.children||[];
   const colorOf = d => { let n=d; while(n.depth>1) n=n.parent; return PALETTE[topKids.indexOf(n)%PALETTE.length]; };
   const shade = (hex,depth) => { const c=d3.color(hex); return c?c.darker(depth*.35).toString():hex; };
-  const tooltip = document.getElementById('tooltip');
   const totalVal = root.value||1;
 
   const cell = svg.selectAll('g.cell').data(root.leaves()).enter()
@@ -664,71 +825,76 @@ function renderTreemap(data) {
 
   cell.each(function(d) {
     const cw=d.x1-d.x0, ch=d.y1-d.y0, g=d3.select(this);
+    const ink=labelColor(shade(colorOf(d),d.depth-1));
     if (cw>45&&ch>22) {
       const mc=Math.max(3,Math.floor((cw-12)/7.5));
-      const lbl=d.data.name.length>mc?d.data.name.slice(0,mc-1)+'…':d.data.name;
       g.append('text').attr('x',6).attr('y',16)
         .attr('font-size',Math.min(12,Math.max(9,cw/10)))
-        .attr('font-weight','500').attr('fill','rgba(255,255,255,.88)').text(lbl);
+        .attr('font-weight','600').attr('fill',ink).text(truncateLabel(d.data.name, mc));
     }
     if (cw>55&&ch>38)
       g.append('text').attr('x',6).attr('y',30).attr('font-size',10)
-        .attr('fill','rgba(255,255,255,.5)').text(fmt(d.data.size||d.value));
+        .attr('fill',ink).text(fmt(d.data.size||d.value));
   });
 
   cell
     .on('mousemove',(ev,d) => {
-      tooltip.style.display='block';
-      tooltip.style.left=Math.min(ev.clientX+14,window.innerWidth-320)+'px';
-      tooltip.style.top=Math.max(10,ev.clientY-10)+'px';
-      tooltip.innerHTML=`
-        <div class="tt-name">${d.data.name}</div>
-        <div class="tt-path">${d.data.path}</div>
-        <div class="tt-size">${fmt(d.data.size||d.value)}</div>
-        <div class="tt-pct">${pctOf(d.data.size||d.value,totalVal)} of this view</div>
-        ${d.data.isDir!==false?'<div class="tt-hint">Click to drill down →</div>':''}`;
+      lastMouse = { x: ev.clientX, y: ev.clientY };
+      showTooltip(d, totalVal, ev.clientX, ev.clientY);
     })
     .on('mouseleave',()=>{ tooltip.style.display='none'; })
     .on('click',(_,d)=>{ if(d.data.isDir===false)return; tooltip.style.display='none'; goTo(d.data.path); });
+
+  refreshTooltip(totalVal);
 }
 
 // ── Sidebar ──────────────────────────────────────────────────
 function renderSidebar(data) {
   const list = document.getElementById('sidebar-list');
-  list.innerHTML = '';
+  list.textContent = '';
   const items = (data.children||[]).filter(c=>c.size>0);
   if (!items.length) return;
   const maxSz = items[0].size||1;
 
+  const el = (tag, cls) => { const e = document.createElement(tag); if (cls) e.className = cls; return e; };
   items.forEach((item,i) => {
     const color = PALETTE[i%PALETTE.length];
-    const div = document.createElement('div');
-    div.className = 'sitem'+(item.isDir===false?' file':'');
+    const isDir = item.isDir!==false;
+    const div = el('div', 'sitem'+(isDir?'':' file'));
     div.style.animationDelay = Math.min(i*20,200)+'ms';
 
-    const actionsHtml = item.isDir!==false ? `
-      <div class="sitem-actions">
-        <button class="sitem-refresh-btn" title="Refresh this folder">↺</button>
-      </div>` : '';
+    // Folders get a real <button> (keyboard + screen reader); the refresh button is a sibling, not nested.
+    const main = el(isDir ? 'button' : 'div', 'sitem-main');
+    if (isDir) {
+      main.type = 'button';
+      main.setAttribute('aria-label', `Open ${item.name}, ${fmt(item.size)}`);
+      main.addEventListener('click', () => goTo(item.path));
+    }
+    const top = el('div', 'sitem-top');
+    const dot = el('div', 'sitem-dot'); dot.style.background = color;
+    const name = el('div', 'sitem-name'); name.title = item.path; name.textContent = item.name;
+    const size = el('div', 'sitem-size'); size.textContent = fmt(item.size);
+    top.append(dot, name, size);
+    const barWrap = el('div', 'sitem-bar-wrap');
+    const bar = el('div', 'sitem-bar');
+    bar.style.background = color;
+    bar.style.width = Math.max(1,(item.size/maxSz)*100)+'%';
+    barWrap.appendChild(bar);
+    main.append(top, barWrap);
+    div.appendChild(main);
 
-    div.innerHTML = `
-      <div class="sitem-top">
-        <div class="sitem-dot" style="background:${color}"></div>
-        <div class="sitem-name" title="${item.path}">${item.name}</div>
-        <div class="sitem-size">${fmt(item.size)}</div>
-        ${actionsHtml}
-      </div>
-      <div class="sitem-bar-wrap">
-        <div class="sitem-bar" style="background:${color};width:${Math.max(1,(item.size/maxSz)*100)}%"></div>
-      </div>`;
-
-    if (item.isDir!==false) {
-      div.addEventListener('click', e => {
-        if (e.target.classList.contains('sitem-refresh-btn')) return;
-        goTo(item.path);
-      });
-      const refreshBtn = div.querySelector('.sitem-refresh-btn');
-      if (refreshBtn) refreshBtn.addEventListener('click', e => { e.stopPropagation(); refreshPath(item.path); });
+    if (isDir) {
+      const actions = el('div', 'sitem-actions');
+      const btn = el('button', 'sitem-refresh-btn');
+      btn.type = 'button';
+      btn.textContent = '↺';
+      btn.dataset.path = item.path;
+      btn.setAttribute('aria-label', `Refresh ${item.name}`);
+      btn.title = 'Refresh this folder';
+      if (refreshingPaths.has(item.path)) { btn.classList.add('spinning'); btn.setAttribute('aria-busy', 'true'); }
+      btn.addEventListener('click', e => { e.stopPropagation(); refreshPath(item.path); });
+      actions.appendChild(btn);
+      div.appendChild(actions);
     }
     list.appendChild(div);
   });
@@ -736,12 +902,16 @@ function renderSidebar(data) {
 
 // ── Init ─────────────────────────────────────────────────────
 document.getElementById('back-btn').addEventListener('click', goBack);
+document.getElementById('up-btn').addEventListener('click', goUp);
 document.getElementById('refresh-btn').addEventListener('click', () => refreshCurrent(true));
 document.getElementById('path-form').addEventListener('submit', e => { e.preventDefault(); goToPath(); });
 window.addEventListener('resize', () => { if (currentData) renderTreemap(currentData); });
 window.addEventListener('keydown', e => {
-  if (document.activeElement === document.getElementById('path-input')) return;
-  if (e.key==='Backspace'||e.key==='ArrowLeft') goBack();
+  // Never hijack browser/OS shortcuts (Cmd/Ctrl/Alt/Shift+Arrow etc.) or typing in form fields
+  if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  const t = e.target;
+  if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+  if (e.key==='Backspace'||e.key==='ArrowLeft') { e.preventDefault(); goBack(); }
 });
 
 navigate("%%DEFAULT_PATH%%", false);
