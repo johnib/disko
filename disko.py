@@ -29,7 +29,7 @@ SCAN_WORKERS = 12   # max concurrent du processes (global cap across all scans a
 PREFETCH_WORKERS = 4  # background prefetch workers
 CACHE_FILE = os.path.expanduser(os.environ.get('DISKO_CACHE') or '~/.disko_cache.json')
 CACHE_VERSION = 2  # bump when the cached child-dict shape changes incompatibly
-                    # (v2: loose files became per-type-bucket entries with 'fileType')
+# (v2: loose files became per-type-bucket entries with 'fileType')
 PREFETCH_TOP_N = 10  # prefetch top-N largest subdirs after each scan
 PREFETCH_MAX_DEPTH = 1  # how many levels below a scanned dir to prefetch
 CACHE_TTL = 300  # seconds; older cache hits are served, then re-scanned and re-streamed
@@ -367,7 +367,7 @@ COMPOUND_ARCHIVE_SUFFIXES = {'tar.gz', 'tar.bz2', 'tar.xz', 'tar.zst', 'tar.lz4'
 _EXT_TO_TYPE = {ext: t for t, exts in FILE_TYPE_EXTENSIONS.items() for ext in exts}
 
 _BUCKET_LABELS = {'image': 'images', 'video': 'video', 'audio': 'audio',
-                   'archive': 'archives', 'document': 'documents', 'code': 'code', 'other': 'other'}
+                  'archive': 'archives', 'document': 'documents', 'code': 'code', 'other': 'other'}
 
 
 def classify_file(name: str) -> str:
