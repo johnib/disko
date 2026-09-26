@@ -705,11 +705,17 @@ const PALETTE = [
   '#f59e0b','#3b82f6','#10b981','#8b5cf6','#ef4444',
 ];
 
+const MAX_LEAVES = 500;      // treemap cells rendered before aggregating the rest
+const MAX_SIDEBAR = 500;     // sidebar rows rendered before showing a "more" note
+const OTHER_COLOR = '#475569';
+
 let navStack = [];
 let currentData = null;
 let activeES = null;
 let navGen = 0;       // bumped on every navigation; stale stream callbacks bail out
 let lastPath = null;  // last requested path, so Refresh can retry a failed first load
+let pendingRender = null;    // { fn, handle } for the next animation-frame flush
+let resizeTimer = null;
 
 function fmt(b) {
   if (!b || b <= 0) return '0 B';
@@ -739,6 +745,42 @@ function timeAgo(ts) {
   if (s < 60)  return `${s}s ago`;
   if (s < 3600) return `${Math.round(s/60)}m ago`;
   return `${Math.round(s/3600)}h ago`;
+}
+
+// Keep the largest (max-1) items and fold the rest into one aggregate entry.
+function capChildren(children, max, parentPath) {
+  if (children.length <= max) return children;
+  const sorted = children.slice().sort((a,b) => b.size-a.size);
+  const kept = sorted.slice(0, max-1), rest = sorted.slice(max-1);
+  const size = rest.reduce((s,c) => s+c.size, 0);
+  kept.push({ name: `${rest.length} smaller items`, path: parentPath||'',
+              size, isDir: false, aggregate: true });
+  return kept;
+}
+
+// ── Render batching ─────────────────────────────────────────
+// Coalesce bursts of stream events into at most one render per animation frame.
+function scheduleRender(fn) {
+  if (pendingRender) { pendingRender.fn = fn; return; }
+  const job = { fn, handle: 0 };
+  pendingRender = job;
+  job.handle = requestAnimationFrame(() => {
+    if (pendingRender !== job) return;
+    pendingRender = null;
+    job.fn();
+  });
+}
+function flushRender() {
+  const job = pendingRender;
+  if (!job) return;
+  pendingRender = null;
+  cancelAnimationFrame(job.handle);
+  job.fn();
+}
+function cancelRender() {
+  if (!pendingRender) return;
+  cancelAnimationFrame(pendingRender.handle);
+  pendingRender = null;
 }
 
 // ── Streaming ────────────────────────────────────────────────
@@ -778,13 +820,14 @@ function cancelStream() {
 function navigate(path, force, onCommit) {
   const gen = ++navGen;
   lastPath = path;
+  cancelRender();
   document.getElementById('error-overlay').classList.remove('show');
   hideCacheBadge();
   setProgress(0);
   setScanStatus('scanning…', false);
 
   let items = [];
-  let meta = null, totalDirs = 0, received = 0, refreshing = false;
+  let meta = null, totalDirs = 0, received = 0, total = 0, refreshing = false;
 
   startStream(path, force, gen, {
     onStart(msg) {
@@ -794,13 +837,15 @@ function navigate(path, force, onCommit) {
       render({ path: msg.path, name: msg.name, size: 0, children: [] });
     },
     onRevalidating() {
+      flushRender();  // show the full cached listing before revalidation starts
       setProgress(-1);
       setScanStatus('refreshing…', false);
     },
     onRefresh(msg) {
       // Stale cache was re-scanned: buffer the fresh listing, swap it in on done
+      flushRender();
       meta = msg; totalDirs = msg.total_dirs; received = 0;
-      items = []; refreshing = true;
+      items = []; total = 0; refreshing = true;
     },
     onChild(item) {
       received++;
@@ -808,17 +853,21 @@ function navigate(path, force, onCommit) {
       let lo = 0, hi = items.length;
       while (lo < hi) { const mid = (lo+hi)>>1; (items[mid].size||0) >= (item.size||0) ? lo=mid+1 : hi=mid; }
       items.splice(lo, 0, item);
+      total += (item.size||0);
       if (refreshing) return;
-      const total = items.reduce((s,i) => s+(i.size||0), 0);
-      renderData({ path: meta.path, name: meta.name, size: total, children: [...items] });
-      if (totalDirs > 0) setProgress(Math.round((received/totalDirs)*100));
-      setScanStatus(`${received} / ${totalDirs}`, false);
+      const n = received;
+      scheduleRender(() => {
+        if (gen !== navGen) return;
+        renderData({ path: meta.path, name: meta.name, size: total, children: items.slice() });
+        if (totalDirs > 0) setProgress(Math.round((n/totalDirs)*100));
+        setScanStatus(`${n} / ${totalDirs}`, false);
+      });
     },
     onDone() {
+      flushRender();
       if (refreshing) {
         hideCacheBadge();
-        const total = items.reduce((s,i) => s+(i.size||0), 0);
-        renderData({ path: meta.path, name: meta.name, size: total, children: [...items] });
+        renderData({ path: meta.path, name: meta.name, size: total, children: items.slice() });
       }
       setProgress(100);
       setScanStatus('done ✓', true);
@@ -826,6 +875,7 @@ function navigate(path, force, onCommit) {
       document.getElementById('refresh-btn').classList.remove('spinning');
     },
     onError(err) {
+      flushRender();
       setProgress(-1); setScanStatus('', true);
       document.getElementById('error-detail').textContent = err;
       document.getElementById('error-overlay').classList.add('show');
@@ -951,7 +1001,7 @@ function renderTreemap(data) {
   const W = wrap.clientWidth-20, H = wrap.clientHeight-20;
   const svg = d3.select('#treemap').attr('width',W).attr('height',H);
   svg.selectAll('*').remove();
-  const children = (data.children||[]).filter(hasSizeInfo);
+  const children = capChildren((data.children||[]).filter(hasSizeInfo), MAX_LEAVES, data.path);
   if (!children.length) return;
   // Unknown / zero-size partial entries get a small nominal area so they stay visible.
   const knownTotal = children.reduce((s,c)=>s+(c.size||0),0);
@@ -961,8 +1011,11 @@ function renderTreemap(data) {
     .sum(d=>d.children?0:(d.size>0?d.size:stubSize)).sort((a,b)=>b.value-a.value);
   d3.treemap().size([W,H]).paddingOuter(3).paddingInner(2).round(true)(root);
 
-  const topKids = root.children||[];
-  const colorOf = d => { let n=d; while(n.depth>1) n=n.parent; return PALETTE[topKids.indexOf(n)%PALETTE.length]; };
+  (root.children||[]).forEach((n,i) => { n.colorIdx = i; });
+  const colorOf = d => {
+    let n=d; while(n.depth>1) n=n.parent;
+    return n.data.aggregate ? OTHER_COLOR : PALETTE[n.colorIdx%PALETTE.length];
+  };
   const shade = (hex,depth) => { const c=d3.color(hex); return c?c.darker(depth*.35).toString():hex; };
   const tooltip = document.getElementById('tooltip');
   const totalVal = knownTotal||1;
@@ -1015,8 +1068,9 @@ function renderSidebar(data) {
   const list = document.getElementById('sidebar-list');
   list.innerHTML = '';
   // Mount points have unknown size (0) but are still listed so they can be opened.
-  const items = (data.children||[]).filter(c=>hasSizeInfo(c)||c.mount);
-  if (!items.length) return;
+  const all = (data.children||[]).filter(c=>hasSizeInfo(c)||c.mount);
+  if (!all.length) return;
+  const items = all.length > MAX_SIDEBAR ? all.slice(0, MAX_SIDEBAR) : all;
   const maxSz = items[0].size||1;
 
   items.forEach((item,i) => {
@@ -1053,13 +1107,27 @@ function renderSidebar(data) {
     }
     list.appendChild(div);
   });
+
+  if (all.length > items.length) {
+    const hidden = all.slice(items.length);
+    const note = document.createElement('div');
+    note.className = 'sitem file';
+    note.style.animation = 'none';
+    note.innerHTML = '<div class="sitem-top"><div class="sitem-name"></div><div class="sitem-size"></div></div>';
+    note.querySelector('.sitem-name').textContent = `+ ${hidden.length} smaller items not shown`;
+    note.querySelector('.sitem-size').textContent = fmt(hidden.reduce((s,c) => s+c.size, 0));
+    list.appendChild(note);
+  }
 }
 
 // ── Init ─────────────────────────────────────────────────────
 document.getElementById('back-btn').addEventListener('click', goBack);
 document.getElementById('refresh-btn').addEventListener('click', () => refreshCurrent(true));
 document.getElementById('path-form').addEventListener('submit', e => { e.preventDefault(); goToPath(); });
-window.addEventListener('resize', () => { if (currentData) renderTreemap(currentData); });
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { if (currentData) renderTreemap(currentData); }, 150);
+});
 window.addEventListener('keydown', e => {
   if (document.activeElement === document.getElementById('path-input')) return;
   if (e.key==='Backspace'||e.key==='ArrowLeft') goBack();
