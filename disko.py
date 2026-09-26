@@ -9,6 +9,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import platform
 import subprocess
 import tempfile
 import threading
@@ -151,6 +152,61 @@ def cache_delete(path: str):
 
 
 # ── Scanning ─────────────────────────────────────────────────────────────────
+#
+# Sizes are allocated disk usage (blocks), both for directories (du -k) and
+# for loose files (st_blocks * 512), so sparse files are measured the same way
+# from the parent and after drilling in.
+#
+# Known limitation -- hard links: each child directory is measured by its own
+# du process (in parallel, so results can stream in quickly). du only
+# de-duplicates hard links within a single run, so a file hard-linked into two
+# sibling directories is counted in both (pnpm, nix, ccache trees, Time
+# Machine-style backups). The totals shown for a folder can therefore exceed
+# its real usage. Each child's own size is still correct in isolation.
+
+
+def _resolve_scan_path(path: str) -> str:
+    path = norm_path(path)
+    # On macOS "/" is the read-only system volume, and the Data volume is
+    # reachable both through firmlinks (/Users, /Applications, ...) and via
+    # /System/Volumes/Data -- all on the same st_dev, so du -x counts it more
+    # than once. Scan the Data volume directly instead.
+    if path in ('/', '//') and platform.system() == "Darwin":
+        return "/System/Volumes/Data"
+    return path
+
+
+def _alloc_size(entry) -> int:
+    """Allocated size of a non-directory entry (0 if it can't be stat'ed)."""
+    try:
+        st = entry.stat(follow_symlinks=False)
+    except OSError:
+        return 0
+    blocks = getattr(st, 'st_blocks', None)
+    return blocks * 512 if blocks is not None else st.st_size
+
+
+def _split_mounts(path: str, dirs: list):
+    """Split dirs into (same-filesystem dirs, mount point dirs)."""
+    try:
+        parent_dev = os.stat(path).st_dev
+    except OSError:
+        return dirs, []
+    local, mounts = [], []
+    for e in dirs:
+        try:
+            dev = e.stat(follow_symlinks=False).st_dev
+        except OSError:
+            dev = parent_dev
+        (mounts if dev != parent_dev else local).append(e)
+    return local, mounts
+
+
+def _mount_child(entry) -> dict:
+    # Another filesystem is mounted here: don't run du on it (it could be a
+    # network share or an external disk). Size is unknown; drill in to scan it.
+    return {'name': entry.name, 'path': entry.path, 'size': 0, 'isDir': True, 'mount': True}
+
 
 def norm_path(path: str) -> str:
     """Absolute, user-expanded, normalized path (never starts with '-')."""
@@ -212,7 +268,7 @@ def _cacheable(children) -> bool:
 
 def scan_to_list(path: str):
     """Scan path and return list of child dicts, or None if it can't be read."""
-    path = norm_path(path)
+    path = _resolve_scan_path(path)
     try:
         entries = list(os.scandir(path))
     except OSError:
@@ -221,9 +277,10 @@ def scan_to_list(path: str):
     dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
     files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
 
-    file_total = sum(_file_size(e) for e in files)
+    file_total = sum(_alloc_size(e) for e in files)
+    dirs, mounts = _split_mounts(path, dirs)
 
-    children = []
+    children = [_mount_child(e) for e in mounts]
     with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futures = {ex.submit(du_bounded, e.path): e for e in dirs}
         for fut in concurrent.futures.as_completed(futures):
@@ -239,13 +296,6 @@ def scan_to_list(path: str):
 
     children.sort(key=_size_key)
     return children
-
-
-def _file_size(entry) -> int:
-    try:
-        return entry.stat(follow_symlinks=False).st_size
-    except OSError:
-        return 0
 
 
 # ── Background prefetch pool ─────────────────────────────────────────────────
@@ -332,7 +382,7 @@ def _revalidate(path: str, started: float, result: dict):
 def stream_directory(path: str, write_event, force: bool = False, stop=None):
     if stop is None:
         stop = threading.Event()
-    path = norm_path(path)
+    path = _resolve_scan_path(path)
     if not os.path.isdir(path):
         write_event({'type': 'error', 'error': 'Not a directory or not found'})
         return
@@ -396,17 +446,22 @@ def stream_directory(path: str, write_event, force: bool = False, stop=None):
 
     dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
     files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
-    file_total = sum(_file_size(e) for e in files)
+    file_total = sum(_alloc_size(e) for e in files)
+    total_dirs = len(dirs)
+    dirs, mounts = _split_mounts(path, dirs)
 
     write_event({
         'type': 'start',
         'path': path,
         'name': os.path.basename(path) or path,
-        'total_dirs': len(dirs),
+        'total_dirs': total_dirs,
         'from_cache': False,
     })
 
-    collected = []
+    # Mount points are not du'ed (other filesystem); emit them first.
+    collected = [_mount_child(e) for e in mounts]
+    for child in collected:
+        write_event({'type': 'child', **child})
     # Not a `with` block: its exit would wait for every running du after a disconnect
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS)
     futures = {ex.submit(du_bounded, e.path, stop): e for e in dirs}
@@ -557,6 +612,8 @@ body {
 .sitem:hover { background: #1e2535; }
 .sitem.file { cursor: default; }
 .sitem.unknown .sitem-size { color: #f59e0b; font-style: italic; }
+.sitem.mount .sitem-name { font-style: italic; }
+.sitem.mount .sitem-bar-wrap { visibility: hidden; }
 .sitem-top { display: flex; align-items: center; gap: 7px; }
 .sitem-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .sitem-name { flex: 1; font-size: 12px; color: #cbd5e1;
@@ -664,6 +721,7 @@ function fmt(b) {
 function isUnknown(c) { return c.size == null; }
 function hasSizeInfo(c) { return c.size > 0 || !!c.status; }
 function sizeLabel(c) {
+  if (c.mount) return 'mount';
   if (isUnknown(c)) return c.status === 'timeout' ? 'timed out' : 'unknown';
   return (c.status ? '≥ ' : '') + fmt(c.size);
 }
@@ -927,14 +985,15 @@ function renderTreemap(data) {
 function renderSidebar(data) {
   const list = document.getElementById('sidebar-list');
   list.innerHTML = '';
-  const items = (data.children||[]).filter(hasSizeInfo);
+  // Mount points have unknown size (0) but are still listed so they can be opened.
+  const items = (data.children||[]).filter(c=>hasSizeInfo(c)||c.mount);
   if (!items.length) return;
   const maxSz = items[0].size||1;
 
   items.forEach((item,i) => {
     const color = PALETTE[i%PALETTE.length];
     const div = document.createElement('div');
-    div.className = 'sitem'+(item.isDir===false?' file':'')+(item.status?' unknown':'');
+    div.className = 'sitem'+(item.isDir===false?' file':'')+(item.status?' unknown':'')+(item.mount?' mount':'');
     if (item.status) div.title = statusText(item);
     div.style.animationDelay = Math.min(i*20,200)+'ms';
 
