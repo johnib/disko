@@ -135,6 +135,14 @@ def _json_safe(value) -> bool:
 # (see _dir_child) -- 'partial' is the sole status that coexists with a real size.
 _KNOWN_CHILD_STATUSES = frozenset({'partial'})
 
+# Every key a child dict the app itself ever writes can have (_dir_child, _mount_child,
+# _iter_children's bucket dicts). An extra key isn't just inert: write_event() spreads
+# the whole child dict into the SSE event, and renderTreemap() feeds it straight to
+# d3.hierarchy() -- a 'children' key there makes D3 treat the cached child as an
+# internal node with its own nested (unvalidated) children, and other unanticipated
+# keys risk colliding with a future protocol/D3 field the same way 'type' did.
+_KNOWN_CHILD_KEYS = frozenset({'name', 'path', 'size', 'isDir', 'fileType', 'status', 'mount'})
+
 
 def _sound_child(c) -> bool:
     """True if c has the fields/types every child dict the app itself ever writes always
@@ -148,12 +156,18 @@ def _sound_child(c) -> bool:
     produces is ever negative) ancestor total otherwise. 'size' is None for a du
     failure/timeout in the real app, never any other non-number. The optional fields
     (fileType/status/mount) are constrained to the exact values the app itself ever
-    writes, per _dir_child/_mount_child/_iter_children's bucket dicts -- and _json_safe
-    is checked over every value in the whole dict as a final backstop, so an
-    unanticipated non-finite value under any key (including a field a future version
-    adds without updating this validator) still can't break the SSE JSON boundary
-    (json.dumps(..., allow_nan=False) in do_GET's write_event)."""
+    writes, per _dir_child/_mount_child/_iter_children's bucket dicts. Any key outside
+    _KNOWN_CHILD_KEYS is rejected outright -- write_event() spreads a cached child
+    straight into the SSE event and renderTreemap() feeds it straight to d3.hierarchy(),
+    so an extra key isn't just inert: it can collide with a protocol field (as 'type'
+    did) or a D3-meaningful one (like 'children', which D3 would treat as a nested,
+    unvalidated hierarchy level). _json_safe is checked over every value in the whole
+    dict as a final backstop, so a non-finite value under any of the known keys still
+    can't break the SSE JSON boundary (json.dumps(..., allow_nan=False) in do_GET's
+    write_event)."""
     if not isinstance(c, dict):
+        return False
+    if not c.keys() <= _KNOWN_CHILD_KEYS:
         return False
     size = c.get('size')
     file_type = c.get('fileType')

@@ -590,6 +590,25 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
         self.assertFalse(disko._sound_child(
             {'name': 'x', 'path': '/x', 'size': 1, 'isDir': True, 'status': {}}))
 
+    def test_frontend_reserved_or_unknown_key_rejected(self):
+        # A cached child's 'children' key isn't just an inert extra field: D3 treats
+        # it as a nested hierarchy level (see renderTreemap's d3.hierarchy() call),
+        # so a cached {'children': [{}]} would make the browser render a bogus nested
+        # node and can crash truncateLabel on the nested node's undefined name. Any
+        # key outside the real v2 child schema is rejected, not just json-safety-checked.
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': False, 'children': [{}]}))
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': False, 'bogus': 1}))
+        # 'type' is the SSE protocol's own discriminator, never a stored child field
+        # (see write_event's {**child, 'type': 'child'}) -- a cached child claiming it
+        # must be rejected too, not merely overridden at the writer.
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': False, 'type': 'done'}))
+        self.assertTrue(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': True,
+             'fileType': 'image', 'status': 'partial', 'mount': True}))
+
     def test_non_finite_value_under_unknown_key_rejected(self):
         # _json_safe is a general backstop: a non-finite float under a field this
         # validator's author never anticipated (not just size/status/mount) must still
@@ -737,20 +756,23 @@ class TestBoundedScanning(TempTreeMixin, unittest.TestCase):
         events = self._cache_hit_events(0)
         self.assertEqual([e['type'] for e in events], ['start', 'done'])
 
-    def test_cached_child_cannot_override_event_type(self):
-        # write_event({'type': 'child', **child}) would let a cached child's own
-        # 'type' key (from a corrupted/hand-edited cache file -- _sound_child allows
-        # unknown extra keys) win over the dict literal's 'type': 'child', turning
-        # the SSE event into a bogus 'done'/'error' and truncating the listing (the
-        # browser's EventSource closes on an unexpected 'done'/'error'). The server-
-        # controlled discriminator must always win regardless of what's cached.
+    def test_cached_child_with_type_key_is_a_full_cache_miss(self):
+        # A cached child carrying a 'type' key (from a corrupted/hand-edited cache
+        # file) is now rejected by _sound_child's key whitelist -- not just
+        # neutralized at the SSE-writer boundary -- so the whole entry is treated as
+        # a miss and the folder is rescanned live rather than serving the poisoned
+        # entry at all. (write_event's {**child, 'type': 'child'} construction is a
+        # second line of defense in case a future schema change lets a reserved key
+        # back in; see test_frontend_reserved_or_unknown_key_rejected.)
         poisoned = {'name': 'x', 'path': os.path.join(self.root, 'x'), 'size': 1,
                     'isDir': False, 'type': 'done'}
-        disko.cache_set(self.root, [poisoned], scanned_at=time.time())
+        self.assertTrue(disko.cache_set(self.root, [poisoned], scanned_at=time.time()))
+        self.assertIsNone(disko.cache_get(self.root))
         events = []
         disko.stream_directory(self.root, lambda d: d is not None and events.append(d))
-        self.assertEqual([e['type'] for e in events], ['start', 'child', 'done'])
-        self.assertEqual(events[1]['name'], 'x')
+        self.assertFalse(events[0]['from_cache'])
+        self.assertEqual(events[0]['type'], 'start')
+        self.assertEqual(events[-1]['type'], 'done')
 
     def test_stream_rescans_once_after_version_bump(self):
         # Simulate a pre-upgrade cache entry (no 'version' key) already in memory --
@@ -780,19 +802,6 @@ class TestBoundedScanning(TempTreeMixin, unittest.TestCase):
         self.assertGreater(entry['scanned_at'], stale_at)
         self.assertEqual(events[2]['scanned_at'], entry['scanned_at'])
         self.assertIn('big', [c['name'] for c in entry['children']])
-
-    def test_stale_cached_child_type_key_cannot_override_event(self):
-        # Same discriminator-override risk as the fresh-cache-hit case, but for the
-        # cached children emitted before revalidation starts on a stale entry.
-        poisoned = {'name': 'x', 'path': os.path.join(self.root, 'x'), 'size': 1,
-                    'isDir': False, 'type': 'error'}
-        disko.cache_set(self.root, [poisoned], scanned_at=time.time() - disko.CACHE_TTL - 10)
-        events = []
-        disko.stream_directory(self.root, lambda d: d is not None and events.append(d))
-        child_events = [e for e in events if e.get('name') == 'x']
-        self.assertTrue(child_events)
-        for e in child_events:
-            self.assertEqual(e['type'], 'child')
 
     def test_stale_revalidate_finishes_after_disconnect(self):
         stop = threading.Event()
