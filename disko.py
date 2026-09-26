@@ -100,12 +100,17 @@ def _cache_key(path: str) -> str:
 
 def _sound_child(c) -> bool:
     """True if c has the fields/types every child dict the app itself ever writes always
-    has (name/path/size/isDir -- see _dir_child, _mount_child, _iter_children's bucket
-    dicts). _propagate_size subscripts c['path'] directly for isDir-truthy children (would
-    otherwise raise KeyError), and both _size_key's sort and its own size-summing negate/
-    add every child's 'size' (would otherwise raise TypeError on a non-numeric value) --
-    'size' is None for a du failure/timeout in the real app, never any other non-number."""
-    return (isinstance(c, dict) and 'name' in c and 'path' in c and 'isDir' in c
+    has (name/path/size/isDir, all as the app's own types -- see _dir_child, _mount_child,
+    _iter_children's bucket dicts). Every field here is required because a downstream
+    reader assumes its type without checking: _propagate_size passes an isDir-truthy
+    child's 'path' straight into _cache_key -> os.path.expanduser (TypeError on non-str,
+    e.g. None), and both _size_key's sort and _propagate_size's own size-summing negate/
+    add every child's 'size' (TypeError on a non-numeric value) -- 'size' is None for a
+    du failure/timeout in the real app, never any other non-number."""
+    return (isinstance(c, dict)
+            and isinstance(c.get('name'), str)
+            and isinstance(c.get('path'), str)
+            and isinstance(c.get('isDir'), bool)
             and (c.get('size') is None
                  or (isinstance(c.get('size'), (int, float)) and not isinstance(c.get('size'), bool))))
 

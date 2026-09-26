@@ -469,6 +469,20 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
                                                'size': 1, 'isDir': True}], scanned_at=200.0))
         self.assertIsNone(disko.cache_get(self.root))  # still malformed: a miss, not stale data
 
+    def test_propagation_into_child_with_null_path_does_not_crash(self):
+        # A child with the right keys but a null 'path' (structurally complete, wrong
+        # type) must not crash _propagate_size's _cache_key(c['path']) ->
+        # os.path.expanduser call, which requires a str (TypeError on None).
+        big = os.path.join(self.root, 'big')
+        with disko._cache_lock:
+            disko._cache[disko._cache_key(self.root)] = {
+                'children': [{'name': 'big', 'path': None, 'size': 10, 'isDir': True}],
+                'scanned_at': 1.0, 'version': disko.CACHE_VERSION,
+            }
+        self.assertTrue(disko.cache_set(big, [{'name': 'a', 'path': os.path.join(big, 'a'),
+                                               'size': 1, 'isDir': True}], scanned_at=200.0))
+        self.assertIsNone(disko.cache_get(self.root))  # still malformed: a miss, not stale data
+
     def test_non_dict_cache_entry_treated_as_miss(self):
         # A genuinely non-dict, non-None, truthy value: None alone would already be
         # caught by cache_get's earlier "not a sound entry" check without ever
