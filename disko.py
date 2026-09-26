@@ -99,12 +99,15 @@ def _cache_key(path: str) -> str:
 
 
 def _sound_child(c) -> bool:
-    """True if c has the fields every child dict the app itself ever writes always has
-    (name/path/size/isDir -- see _dir_child, _mount_child, _iter_children's bucket dicts).
-    _propagate_size subscripts c['path'] directly for isDir-truthy children, which would
-    otherwise raise KeyError on a hand-edited entry with a structurally incomplete child."""
-    return (isinstance(c, dict) and 'name' in c and 'path' in c
-            and 'size' in c and 'isDir' in c)
+    """True if c has the fields/types every child dict the app itself ever writes always
+    has (name/path/size/isDir -- see _dir_child, _mount_child, _iter_children's bucket
+    dicts). _propagate_size subscripts c['path'] directly for isDir-truthy children (would
+    otherwise raise KeyError), and both _size_key's sort and its own size-summing negate/
+    add every child's 'size' (would otherwise raise TypeError on a non-numeric value) --
+    'size' is None for a du failure/timeout in the real app, never any other non-number."""
+    return (isinstance(c, dict) and 'name' in c and 'path' in c and 'isDir' in c
+            and (c.get('size') is None
+                 or (isinstance(c.get('size'), (int, float)) and not isinstance(c.get('size'), bool))))
 
 
 def _sound_entry(entry) -> bool:
