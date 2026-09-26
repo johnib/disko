@@ -77,6 +77,13 @@ python3 disko.py --path /data --no-browser
 3. **Visualization** — the browser renders an interactive, zoomable treemap using [D3.js](https://d3js.org/). Node area is proportional to disk usage.
 4. **Cache** — completed scan results are serialized to JSON and written to `~/.disko_cache.json`. On subsequent runs, the cached data is served immediately while a background refresh runs concurrently.
 
+### What the sizes mean
+
+- **Allocated size.** Folders are sized with `du -k` and loose files with their allocated blocks (`st_blocks × 512`), so both use the same measure. A sparse file (such as `Docker.raw`) counts as the space it actually uses on disk, not its apparent length.
+- **Mount points.** A subfolder that is on a different filesystem, such as an external disk, a network share, or `/Volumes/*`, is listed as a `mount` entry with no size. It isn't scanned as part of its parent; click it to scan it separately.
+- **macOS `/`.** Scanning `/` on macOS actually scans `/System/Volumes/Data`. Firmlinks make the Data volume reachable through several paths on the same device, so scanning `/` would count it more than once.
+- **Hard links (known limitation).** Each subfolder is sized by its own `du` process so the results can stream in parallel. `du` only removes duplicate hard links within one run, so a file hard-linked into two sibling folders is counted in both, and the parent's total can come out higher than its real usage. This mostly affects pnpm stores, nix, ccache, and backup trees.
+
 ---
 
 ## Cache

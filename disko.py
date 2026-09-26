@@ -71,6 +71,61 @@ def cache_delete(path: str):
 
 
 # ── Scanning ─────────────────────────────────────────────────────────────────
+#
+# Sizes are allocated disk usage (blocks), both for directories (du -k) and
+# for loose files (st_blocks * 512), so sparse files are measured the same way
+# from the parent and after drilling in.
+#
+# Known limitation -- hard links: each child directory is measured by its own
+# du process (in parallel, so results can stream in quickly). du only
+# de-duplicates hard links within a single run, so a file hard-linked into two
+# sibling directories is counted in both (pnpm, nix, ccache trees, Time
+# Machine-style backups). The totals shown for a folder can therefore exceed
+# its real usage. Each child's own size is still correct in isolation.
+
+
+def _resolve_scan_path(path: str) -> str:
+    path = os.path.normpath(os.path.expanduser(path))
+    # On macOS "/" is the read-only system volume, and the Data volume is
+    # reachable both through firmlinks (/Users, /Applications, ...) and via
+    # /System/Volumes/Data -- all on the same st_dev, so du -x counts it more
+    # than once. Scan the Data volume directly instead.
+    if path == '/' and platform.system() == "Darwin":
+        return "/System/Volumes/Data"
+    return path
+
+
+def _alloc_size(entry) -> int:
+    """Allocated size of a non-directory entry (0 if it can't be stat'ed)."""
+    try:
+        st = entry.stat(follow_symlinks=False)
+    except OSError:
+        return 0
+    blocks = getattr(st, 'st_blocks', None)
+    return blocks * 512 if blocks is not None else st.st_size
+
+
+def _split_mounts(path: str, dirs: list):
+    """Split dirs into (same-filesystem dirs, mount point dirs)."""
+    try:
+        parent_dev = os.stat(path).st_dev
+    except OSError:
+        return dirs, []
+    local, mounts = [], []
+    for e in dirs:
+        try:
+            dev = e.stat(follow_symlinks=False).st_dev
+        except OSError:
+            dev = parent_dev
+        (mounts if dev != parent_dev else local).append(e)
+    return local, mounts
+
+
+def _mount_child(entry) -> dict:
+    # Another filesystem is mounted here: don't run du on it (it could be a
+    # network share or an external disk). Size is unknown; drill in to scan it.
+    return {'name': entry.name, 'path': entry.path, 'size': 0, 'isDir': True, 'mount': True}
+
 
 def du_single(path: str) -> int:
     try:
@@ -91,7 +146,7 @@ def du_single(path: str) -> int:
 
 def scan_to_list(path: str) -> list:
     """Scan path and return list of child dicts."""
-    path = os.path.normpath(os.path.expanduser(path))
+    path = _resolve_scan_path(path)
     if not os.path.isdir(path):
         return []
     try:
@@ -102,12 +157,10 @@ def scan_to_list(path: str) -> list:
     dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
     files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
 
-    file_total = sum(
-        e.stat(follow_symlinks=False).st_size for e in files
-        if _safe_stat(e)
-    )
+    file_total = sum(_alloc_size(e) for e in files)
+    dirs, mounts = _split_mounts(path, dirs)
 
-    children = []
+    children = [_mount_child(e) for e in mounts]
     with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futures = {ex.submit(du_single, e.path): e for e in dirs}
         for fut in concurrent.futures.as_completed(futures):
@@ -129,14 +182,6 @@ def scan_to_list(path: str) -> list:
 
     children.sort(key=lambda c: -c['size'])
     return children
-
-
-def _safe_stat(entry):
-    try:
-        entry.stat(follow_symlinks=False)
-        return True
-    except OSError:
-        return False
 
 
 # ── Background prefetch pool ─────────────────────────────────────────────────
@@ -174,7 +219,7 @@ def _do_prefetch(path: str):
 # ── Streaming (SSE) ───────────────────────────────────────────────────────────
 
 def stream_directory(path: str, write_event, force: bool = False):
-    path = os.path.normpath(os.path.expanduser(path))
+    path = _resolve_scan_path(path)
     if not os.path.isdir(path):
         write_event({'type': 'error', 'error': 'Not a directory or not found'})
         return
@@ -212,19 +257,21 @@ def stream_directory(path: str, write_event, force: bool = False):
 
     dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
     files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
-    file_total = sum(
-        e.stat(follow_symlinks=False).st_size for e in files if _safe_stat(e)
-    )
+    file_total = sum(_alloc_size(e) for e in files)
+    total_dirs = len(dirs)
+    dirs, mounts = _split_mounts(path, dirs)
 
     write_event({
         'type': 'start',
         'path': path,
         'name': os.path.basename(path) or path,
-        'total_dirs': len(dirs),
+        'total_dirs': total_dirs,
         'from_cache': False,
     })
 
-    collected = []
+    collected = [_mount_child(e) for e in mounts]
+    for child in collected:
+        write_event({'type': 'child', **child})
     with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futures = {ex.submit(du_single, e.path): e for e in dirs}
         for fut in concurrent.futures.as_completed(futures):
@@ -362,6 +409,8 @@ body {
 @keyframes fadeSlide { from{opacity:0;transform:translateX(8px)} to{opacity:1;transform:translateX(0)} }
 .sitem:hover { background: #1e2535; }
 .sitem.file { cursor: default; }
+.sitem.mount .sitem-name { font-style: italic; }
+.sitem.mount .sitem-bar-wrap { visibility: hidden; }
 .sitem-top { display: flex; align-items: center; gap: 7px; }
 .sitem-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .sitem-name { flex: 1; font-size: 12px; color: #cbd5e1;
@@ -696,14 +745,15 @@ function renderTreemap(data) {
 function renderSidebar(data) {
   const list = document.getElementById('sidebar-list');
   list.innerHTML = '';
-  const items = (data.children||[]).filter(c=>c.size>0);
+  // Mount points have unknown size (0) but are still listed so they can be opened.
+  const items = (data.children||[]).filter(c=>c.size>0||c.mount);
   if (!items.length) return;
   const maxSz = items[0].size||1;
 
   items.forEach((item,i) => {
     const color = PALETTE[i%PALETTE.length];
     const div = document.createElement('div');
-    div.className = 'sitem'+(item.isDir===false?' file':'');
+    div.className = 'sitem'+(item.isDir===false?' file':'')+(item.mount?' mount':'');
     div.style.animationDelay = Math.min(i*20,200)+'ms';
 
     const actionsHtml = item.isDir!==false ? `
@@ -715,7 +765,7 @@ function renderSidebar(data) {
       <div class="sitem-top">
         <div class="sitem-dot" style="background:${color}"></div>
         <div class="sitem-name" title="${item.path}">${item.name}</div>
-        <div class="sitem-size">${fmt(item.size)}</div>
+        <div class="sitem-size">${item.mount?'mount':fmt(item.size)}</div>
         ${actionsHtml}
       </div>
       <div class="sitem-bar-wrap">
