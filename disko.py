@@ -49,10 +49,11 @@ def cache_load():
 
 
 def cache_save():
-    # Snapshot under the cache lock, but do the (slow) file write outside it
-    with _cache_lock:
-        data = json.dumps(_cache)
+    # Snapshot under the cache lock, but do the (slow) file write outside it.
+    # Snapshot inside the save lock so an older snapshot can't overwrite a newer one.
     with _cache_save_lock:
+        with _cache_lock:
+            data = json.dumps(_cache)
         try:
             with open(CACHE_FILE, 'w') as f:
                 f.write(data)
