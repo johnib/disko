@@ -427,6 +427,9 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
             {'children': [], 'scanned_at': None, 'version': disko.CACHE_VERSION},
             {'children': [], 'scanned_at': float('nan'), 'version': disko.CACHE_VERSION},
             {'children': [], 'scanned_at': 'not-a-number', 'version': disko.CACHE_VERSION},
+            # A dict child missing fields _propagate_size assumes are always present
+            # (name/path/size) -- structurally incomplete, not just non-dict.
+            {'children': [{'isDir': True}], 'scanned_at': time.time(), 'version': disko.CACHE_VERSION},
         ]
         for entry in cases:
             with disko._cache_lock:
@@ -434,6 +437,19 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
             self.assertIsNone(disko.cache_get(self.root), entry)
             # cache_set must not crash reading this entry's raw staleness check either.
             self.assertTrue(disko.cache_set(self.root, []), entry)
+
+    def test_propagation_into_structurally_incomplete_child_does_not_crash(self):
+        # Reproduces the exact reviewer-reported crash: a current-version ancestor entry
+        # whose child dict is missing 'path' must not crash _propagate_size's c['path']
+        # subscript when a descendant is cached (which triggers propagation into it).
+        big = os.path.join(self.root, 'big')
+        with disko._cache_lock:
+            disko._cache[disko._cache_key(self.root)] = {
+                'children': [{'isDir': True}], 'scanned_at': 1.0, 'version': disko.CACHE_VERSION,
+            }
+        self.assertTrue(disko.cache_set(big, [{'name': 'a', 'path': os.path.join(big, 'a'),
+                                               'size': 1, 'isDir': True}], scanned_at=200.0))
+        self.assertIsNone(disko.cache_get(self.root))  # still malformed: a miss, not stale data
 
     def test_non_dict_cache_entry_treated_as_miss(self):
         # A genuinely non-dict, non-None, truthy value: None alone would already be

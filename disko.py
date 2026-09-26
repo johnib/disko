@@ -98,6 +98,15 @@ def _cache_key(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
+def _sound_child(c) -> bool:
+    """True if c has the fields every child dict the app itself ever writes always has
+    (name/path/size/isDir -- see _dir_child, _mount_child, _iter_children's bucket dicts).
+    _propagate_size subscripts c['path'] directly for isDir-truthy children, which would
+    otherwise raise KeyError on a hand-edited entry with a structurally incomplete child."""
+    return (isinstance(c, dict) and 'name' in c and 'path' in c
+            and 'size' in c and 'isDir' in c)
+
+
 def _sound_entry(entry) -> bool:
     """True if entry is a well-formed cache dict (has the keys/types every reader relies on).
 
@@ -106,12 +115,13 @@ def _sound_entry(entry) -> bool:
     in _cache -- cache_load only validates that the top-level JSON is a dict, never each
     per-path value, so a hand-edited or corrupted cache file can put anything at a key,
     including a dict with the right keys but wrong-typed values (e.g. scanned_at: null,
-    which would otherwise raise TypeError when compared to a float)."""
+    which would otherwise raise TypeError when compared to a float), or a children list
+    of dicts that are individually missing fields readers assume are always present."""
     if not isinstance(entry, dict):
         return False
     children = entry.get('children')
     scanned_at = entry.get('scanned_at')
-    return (isinstance(children, list) and all(isinstance(c, dict) for c in children)
+    return (isinstance(children, list) and all(_sound_child(c) for c in children)
             and isinstance(scanned_at, (int, float)) and not isinstance(scanned_at, bool)
             and math.isfinite(scanned_at))
 
