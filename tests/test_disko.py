@@ -104,9 +104,10 @@ class TestCacheEnvOverride(unittest.TestCase):
 
 class TestDuSingle(TempTreeMixin, unittest.TestCase):
     def test_sizes_are_sane(self):
-        big = disko.du_single(os.path.join(self.root, 'big'))
-        small = disko.du_single(os.path.join(self.root, 'small'))
-        empty = disko.du_single(os.path.join(self.root, 'empty'))
+        big, big_status = disko.du_single(os.path.join(self.root, 'big'))
+        small, small_status = disko.du_single(os.path.join(self.root, 'small'))
+        empty, empty_status = disko.du_single(os.path.join(self.root, 'empty'))
+        self.assertEqual((big_status, small_status, empty_status), (None, None, None))
         self.assertIsInstance(big, int)
         # du reports allocated blocks, so allow slack but require the data.
         self.assertGreaterEqual(big, 96 * 1024)
@@ -118,8 +119,18 @@ class TestDuSingle(TempTreeMixin, unittest.TestCase):
         # Results are whole KiB (du -sk * 1024).
         self.assertEqual(big % 1024, 0)
 
-    def test_missing_path_returns_zero(self):
-        self.assertEqual(disko.du_single(os.path.join(self.root, 'does-not-exist')), 0)
+    def test_missing_path_reports_unknown_with_error(self):
+        # A du failure must surface as an unknown size, never as 0.
+        size, status = disko.du_single(os.path.join(self.root, 'does-not-exist'))
+        self.assertIsNone(size)
+        self.assertIsInstance(status, str)
+        self.assertTrue(status)
+
+    def test_dash_named_dir_is_not_an_option(self):
+        os.mkdir(os.path.join(self.root, '-rf'))
+        size, status = disko.du_single(os.path.join(self.root, '-rf'))
+        self.assertIsNone(status)
+        self.assertIsInstance(size, int)
 
 
 class TestScanToList(TempTreeMixin, unittest.TestCase):
@@ -147,9 +158,16 @@ class TestScanToList(TempTreeMixin, unittest.TestCase):
         children = disko.scan_to_list(self.root + os.sep + '.' + os.sep)
         self.assertEqual({c['name'] for c in children}, {'big', 'small', 'empty', '(loose files)'})
 
-    def test_scan_non_directory_returns_empty(self):
-        self.assertEqual(disko.scan_to_list(os.path.join(self.root, 'loose1.txt')), [])
-        self.assertEqual(disko.scan_to_list(os.path.join(self.root, 'nope')), [])
+    def test_scan_unreadable_returns_none(self):
+        # None (not []) so callers skip caching an unreadable/missing directory.
+        self.assertIsNone(disko.scan_to_list(os.path.join(self.root, 'loose1.txt')))
+        self.assertIsNone(disko.scan_to_list(os.path.join(self.root, 'nope')))
+
+    def test_cacheable_rejects_unknown_sizes(self):
+        self.assertFalse(disko._cacheable(None))
+        self.assertTrue(disko._cacheable([]))
+        self.assertTrue(disko._cacheable([{'size': 0, 'status': 'partial'}]))
+        self.assertFalse(disko._cacheable([{'size': 1}, {'size': None, 'status': 'timeout'}]))
 
     def test_scan_empty_dir(self):
         self.assertEqual(disko.scan_to_list(os.path.join(self.root, 'empty')), [])
@@ -305,8 +323,24 @@ class TestBoundedScanning(TempTreeMixin, unittest.TestCase):
     def test_du_bounded_skips_when_stopped(self):
         stop = threading.Event()
         stop.set()
-        self.assertEqual(disko.du_bounded(os.path.join(self.root, 'big'), stop), 0)
-        self.assertGreater(disko.du_bounded(os.path.join(self.root, 'big')), 0)
+        self.assertEqual(disko.du_bounded(os.path.join(self.root, 'big'), stop), (None, 'cancelled'))
+        size, status = disko.du_bounded(os.path.join(self.root, 'big'))
+        self.assertIsNone(status)
+        self.assertGreater(size, 0)
+
+    def test_unknown_size_scan_is_streamed_but_not_cached(self):
+        orig = disko.du_single
+        disko.du_single = lambda path: (None, 'timeout')
+        try:
+            events = []
+            disko.stream_directory(self.root, events.append)
+        finally:
+            disko.du_single = orig
+        kids = [e for e in events if e['type'] == 'child' and e['isDir']]
+        self.assertTrue(kids)
+        self.assertTrue(all(k['size'] is None and k['status'] == 'timeout' for k in kids))
+        self.assertEqual(events[-1]['type'], 'done')
+        self.assertIsNone(disko.cache_get(self.root))
 
 
 class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
