@@ -545,6 +545,47 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
             {'name': 'x', 'path': '/x', 'size': 1, 'isDir': False, 'fileType': 'image'}))
         self.assertTrue(disko._sound_child({'name': 'x', 'path': '/x', 'size': 1, 'isDir': True}))
 
+    def test_bogus_file_type_string_rejected(self):
+        # A string that isn't a real bucket key (not in FILE_TYPE_EXTENSIONS, not
+        # 'other') must be rejected too, not just non-string values.
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': False, 'fileType': 'bogus'}))
+        self.assertTrue(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': False, 'fileType': 'other'}))
+
+    def test_non_finite_status_rejected(self):
+        # A cached child with status: NaN previously passed _sound_child unchanged,
+        # so _current_entry kept accepting the entry on every open -- and the SSE
+        # writer's json.dumps(..., allow_nan=False) then raised ValueError on every
+        # one of those opens, repeating the same partial-start/error sequence forever.
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': True, 'status': float('nan')}))
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': True, 'status': 'bogus'}))
+        self.assertTrue(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': True, 'status': 'partial'}))
+        self.assertTrue(disko._sound_child({'name': 'x', 'path': '/x', 'size': 1, 'isDir': True}))
+
+    def test_non_bool_mount_rejected(self):
+        # 'mount' is always a plain bool in the real app (see _mount_child); a
+        # wrong-typed value here isn't known to crash anything today, but is exactly
+        # the kind of hand-edited/corrupted field this validator exists to catch.
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': None, 'isDir': True, 'mount': 'yes'}))
+        self.assertTrue(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': None, 'isDir': True, 'mount': True}))
+
+    def test_non_finite_value_under_unknown_key_rejected(self):
+        # _json_safe is a general backstop: a non-finite float under a field this
+        # validator's author never anticipated (not just size/status/mount) must still
+        # be rejected, since it would otherwise crash the same allow_nan=False writer.
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': True, 'weird': float('inf')}))
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': True, 'nested': {'a': float('nan')}}))
+        self.assertFalse(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': True, 'listed': [1, float('nan')]}))
+
     def test_oversized_integer_treated_as_miss_not_crash(self):
         # math.isfinite() itself raises OverflowError on an arbitrarily large Python int
         # (json.load decodes JSON integers with unlimited precision, so a hand-edited

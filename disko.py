@@ -112,29 +112,61 @@ def _finite_number(v) -> bool:
         return False
 
 
+def _json_safe(value) -> bool:
+    """True if value would serialize under json.dumps(..., allow_nan=False) without
+    raising -- i.e. contains no NaN/Infinity anywhere. A large int is fine as-is (JSON
+    integers have unlimited precision; only floats can be non-finite). This is the
+    general-purpose backstop behind the specific field checks in _sound_child: it
+    catches a non-finite value under ANY key, including one this validator's author
+    didn't anticipate, rather than requiring every current and future optional/extra
+    field to be enumerated by name."""
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _json_safe(v) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return all(_json_safe(v) for v in value)
+    return True  # str/int/bool/None are always JSON-safe
+
+
+# The only status _cacheable() (disko.py's cache-eligibility check) ever lets reach the
+# persisted cache: _cacheable requires every child's size to be non-None, and du_single's
+# other statuses ('timeout', 'cancelled', an error string) only ever pair with size=None
+# (see _dir_child) -- 'partial' is the sole status that coexists with a real size.
+_KNOWN_CHILD_STATUSES = frozenset({'partial'})
+
+
 def _sound_child(c) -> bool:
     """True if c has the fields/types every child dict the app itself ever writes always
     has (name/path/size/isDir, all as the app's own types -- see _dir_child, _mount_child,
-    _iter_children's bucket dicts). Every field here is required because a downstream
-    reader assumes its type without checking: _propagate_size passes an isDir-truthy
-    child's 'path' straight into _cache_key -> os.path.expanduser (TypeError on non-str,
-    e.g. None), and both _size_key's sort and _propagate_size's own size-summing negate/
-    add every child's 'size' -- TypeError on a non-numeric value, and a silently wrong
-    (NaN/inf-poisoned, or negative -- no allocated size the app itself produces is ever
-    negative) ancestor total otherwise. 'size' is None for a du failure/timeout in the
-    real app, never any other non-number. 'fileType', if present, is always a plain str
-    bucket key (see FILE_TYPE_EXTENSIONS) -- a non-string value here (or elsewhere in an
-    unanticipated field) would otherwise only be caught later, if at all, by the SSE
-    writer's allow_nan=False JSON guard (see do_GET's write_event)."""
+    _iter_children's bucket dicts). Every required field here is checked because a
+    downstream reader assumes its type without checking: _propagate_size passes an
+    isDir-truthy child's 'path' straight into _cache_key -> os.path.expanduser (TypeError
+    on non-str, e.g. None), and both _size_key's sort and _propagate_size's own
+    size-summing negate/add every child's 'size' -- TypeError on a non-numeric value, and
+    a silently wrong (NaN/inf-poisoned, or negative -- no allocated size the app itself
+    produces is ever negative) ancestor total otherwise. 'size' is None for a du
+    failure/timeout in the real app, never any other non-number. The optional fields
+    (fileType/status/mount) are constrained to the exact values the app itself ever
+    writes, per _dir_child/_mount_child/_iter_children's bucket dicts -- and _json_safe
+    is checked over every value in the whole dict as a final backstop, so an
+    unanticipated non-finite value under any key (including a field a future version
+    adds without updating this validator) still can't break the SSE JSON boundary
+    (json.dumps(..., allow_nan=False) in do_GET's write_event)."""
     if not isinstance(c, dict):
         return False
     size = c.get('size')
     file_type = c.get('fileType')
+    status = c.get('status')
+    mount = c.get('mount')
     return (isinstance(c.get('name'), str)
             and isinstance(c.get('path'), str)
             and isinstance(c.get('isDir'), bool)
             and (size is None or (_finite_number(size) and size >= 0))
-            and (file_type is None or isinstance(file_type, str)))
+            and (file_type is None or file_type in FILE_TYPE_EXTENSIONS or file_type == 'other')
+            and (status is None or status in _KNOWN_CHILD_STATUSES)
+            and (mount is None or isinstance(mount, bool))
+            and all(_json_safe(v) for v in c.values()))
 
 
 def _sound_entry(entry) -> bool:
