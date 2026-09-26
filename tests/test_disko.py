@@ -491,6 +491,24 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
             self.assertFalse(disko._sound_child(
                 {'name': 'x', 'path': '/x', 'size': bad_size, 'isDir': True}), bad_size)
 
+    def test_oversized_integer_treated_as_miss_not_crash(self):
+        # math.isfinite() itself raises OverflowError on an arbitrarily large Python int
+        # (json.load decodes JSON integers with unlimited precision, so a hand-edited
+        # cache file can hand one to scanned_at or a child's size) -- the validator that
+        # exists specifically to turn malformed data into a clean miss must not itself
+        # crash on this input.
+        huge = 10 ** 400
+        key = disko._cache_key(self.root)
+        with disko._cache_lock:
+            disko._cache[key] = {'children': [], 'scanned_at': huge, 'version': disko.CACHE_VERSION}
+        self.assertIsNone(disko.cache_get(self.root))
+        with disko._cache_lock:
+            disko._cache[key] = {
+                'children': [{'name': 'x', 'path': '/x', 'size': huge, 'isDir': True}],
+                'scanned_at': 1.0, 'version': disko.CACHE_VERSION,
+            }
+        self.assertIsNone(disko.cache_get(self.root))
+
     def test_non_dict_cache_entry_treated_as_miss(self):
         # A genuinely non-dict, non-None, truthy value: None alone would already be
         # caught by cache_get's earlier "not a sound entry" check without ever

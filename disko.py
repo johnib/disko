@@ -98,6 +98,20 @@ def _cache_key(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
+def _finite_number(v) -> bool:
+    """True if v is a finite, non-bool int/float. math.isfinite() itself can raise
+    OverflowError on an arbitrarily large Python int (json.load decodes JSON integers
+    with unlimited precision, so a hand-edited cache file can hand it one), which would
+    otherwise crash the very validator meant to turn a malformed value into a clean
+    cache miss."""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(v)
+    except OverflowError:
+        return False
+
+
 def _sound_child(c) -> bool:
     """True if c has the fields/types every child dict the app itself ever writes always
     has (name/path/size/isDir, all as the app's own types -- see _dir_child, _mount_child,
@@ -114,8 +128,7 @@ def _sound_child(c) -> bool:
     return (isinstance(c.get('name'), str)
             and isinstance(c.get('path'), str)
             and isinstance(c.get('isDir'), bool)
-            and (size is None
-                 or (isinstance(size, (int, float)) and not isinstance(size, bool) and math.isfinite(size))))
+            and (size is None or _finite_number(size)))
 
 
 def _sound_entry(entry) -> bool:
@@ -131,10 +144,8 @@ def _sound_entry(entry) -> bool:
     if not isinstance(entry, dict):
         return False
     children = entry.get('children')
-    scanned_at = entry.get('scanned_at')
     return (isinstance(children, list) and all(_sound_child(c) for c in children)
-            and isinstance(scanned_at, (int, float)) and not isinstance(scanned_at, bool)
-            and math.isfinite(scanned_at))
+            and _finite_number(entry.get('scanned_at')))
 
 
 def cache_get(path: str):
@@ -1272,9 +1283,16 @@ function navigate(path, force, onCommit) {
 }
 
 function goTo(path, force) {
-  activeFilterType = null;  // a different folder has an unrelated set of type buckets
   const prev = currentData;
-  navigate(path, force, () => { if (prev) navStack.push(prev); });
+  // Cleared inside onCommit (only fires once the server confirms via onStart), not
+  // eagerly here: if the target turns out to be unreadable/gone, onError fires without
+  // onCommit ever running, and the current folder's DOM must stay internally consistent
+  // (filter state and its visual dim/pressed classes in sync) rather than showing a
+  // still-filtered view with no state left to clear it.
+  navigate(path, force, () => {
+    activeFilterType = null;  // a different folder has an unrelated set of type buckets
+    if (prev) navStack.push(prev);
+  });
 }
 
 function refreshCurrent(force=true) {
