@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-26
+
 ### Security
 
 - **Local-only requests** — the server now rejects requests whose `Host` header is not `localhost`/`127.0.0.1`/`[::1]` on its port (DNS rebinding), and cross-site requests by `Origin` or `Sec-Fetch-Site`. The wildcard `Access-Control-Allow-Origin` header was removed.

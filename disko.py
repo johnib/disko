@@ -21,7 +21,7 @@ import webbrowser
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 _default_path = "/"
 _verbose = False  # --verbose: log HTTP requests
 
