@@ -39,6 +39,25 @@ def _wait_for_prefetch(timeout=5.0):
         time.sleep(0.05)
 
 
+def _join_tolerating_prestart_race(t, join_timeout=5, poll_interval=0.01, start_deadline=2.0):
+    """t.join(join_timeout), tolerating the narrow window where a just-created thread
+    appears in threading.enumerate() (via CPython's internal _limbo bookkeeping) before
+    its own start() call -- running concurrently on another thread -- has finished
+    marking it started (join() raises RuntimeError in that window even though start()
+    was already invoked). A single fixed-delay retry can still lose this race under a
+    sufficiently slow/loaded scheduler, so poll every `poll_interval` until the thread
+    becomes joinable or `start_deadline` elapses, then propagate any further failure."""
+    deadline = time.monotonic() + start_deadline
+    while True:
+        try:
+            t.join(join_timeout)
+            return
+        except RuntimeError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(poll_interval)
+
+
 def _write_file(path, size):
     with open(path, 'wb') as f:
         # Random bytes so filesystems with transparent compression still
@@ -118,26 +137,11 @@ class TempTreeMixin(object):
         try:
             # Join background refresh threads (e.g. after a cache hit) so they
             # cannot write into the next test's state, then drain prefetches.
-            #
-            # A just-created thread can appear in threading.enumerate() (via
-            # CPython's internal _limbo bookkeeping) slightly before its own
-            # start() call -- running concurrently on another thread -- has
-            # finished marking it started, so join() can raise "cannot join
-            # thread before it is started" even though start() was already
-            # invoked. Retry once after a brief pause rather than letting that
-            # narrow race abort teardown (which would skip restoring the
-            # globals below and corrupt state for every later test).
+            # See _join_tolerating_prestart_race for why a plain t.join(5) isn't safe.
             for t in set(threading.enumerate()) - self._threads_before:
                 if t.name.startswith('prefetch'):
                     continue
-                for attempt in range(2):
-                    try:
-                        t.join(5)
-                        break
-                    except RuntimeError:
-                        if attempt:
-                            raise
-                        time.sleep(0.05)
+                _join_tolerating_prestart_race(t)
             _wait_for_prefetch()
             with disko._cache_lock:
                 disko._cache.clear()
@@ -156,6 +160,36 @@ class TempTypeTreeMixin(TempTreeMixin):
     """Like TempTreeMixin, but self.root holds _make_type_tree's multi-bucket fixture
     instead of _make_tree's (a single 'sub' dir plus loose files spanning 6 buckets)."""
     _populate_tree = staticmethod(_make_type_tree)
+
+
+class _FlakyJoinThread:
+    """Fake stand-in for a real Thread: .join() raises RuntimeError('cannot join thread
+    before it is started') for the first `fail_times` calls, then succeeds -- lets the
+    retry/deadline logic in _join_tolerating_prestart_race be tested deterministically,
+    without depending on real OS thread scheduling to reproduce the actual race."""
+    def __init__(self, fail_times):
+        self.fail_times = fail_times
+        self.calls = 0
+
+    def join(self, timeout=None):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise RuntimeError('cannot join thread before it is started')
+
+
+class TestJoinTolerance(unittest.TestCase):
+    def test_retries_past_a_single_fixed_delay_attempt(self):
+        # A single fixed-delay retry (the earlier, weaker fix) would give up after one
+        # extra attempt; this thread only becomes joinable on the 6th call, longer than
+        # that would tolerate.
+        fake = _FlakyJoinThread(fail_times=5)
+        _join_tolerating_prestart_race(fake, poll_interval=0.001, start_deadline=1.0)
+        self.assertEqual(fake.calls, 6)
+
+    def test_gives_up_after_the_deadline_elapses(self):
+        fake = _FlakyJoinThread(fail_times=10 ** 6)  # never becomes joinable
+        with self.assertRaises(RuntimeError):
+            _join_tolerating_prestart_race(fake, poll_interval=0.001, start_deadline=0.05)
 
 
 class TestCacheEnvOverride(unittest.TestCase):
