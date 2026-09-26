@@ -24,6 +24,7 @@ SCAN_WORKERS = 12   # parallel du workers per scan
 PREFETCH_WORKERS = 4  # background prefetch workers
 CACHE_FILE = os.path.expanduser('~/.disko_cache.json')
 PREFETCH_TOP_N = 10  # prefetch top-N largest subdirs after each scan
+CACHE_TTL = 300  # seconds; older cache hits are served, then re-scanned and re-streamed
 
 # ── Cache ────────────────────────────────────────────────────────────────────
 
@@ -53,20 +54,59 @@ def cache_save():
             print(f'  Cache save error: {e}')
 
 
+def _cache_key(path: str) -> str:
+    return os.path.normpath(os.path.expanduser(path))
+
+
 def cache_get(path: str):
     with _cache_lock:
-        return _cache.get(path)
+        return _cache.get(_cache_key(path))
 
 
-def cache_set(path: str, children: list):
+def cache_set(path: str, children: list, scanned_at: float = None) -> bool:
+    """Store children for path, stamped with the scan *start* time.
+
+    Skips the write if the existing entry comes from a scan that started
+    later (e.g. a slow prefetch finishing after a forced refresh).
+    Also propagates the new total size into cached ancestor entries.
+    Returns True if the cache was updated.
+    """
+    key = _cache_key(path)
+    if scanned_at is None:
+        scanned_at = time.time()
     with _cache_lock:
-        _cache[path] = {'children': children, 'scanned_at': time.time()}
+        existing = _cache.get(key)
+        if existing and existing.get('scanned_at', 0) > scanned_at:
+            return False
+        _cache[key] = {'children': children, 'scanned_at': scanned_at}
+        _propagate_size(key, sum(c['size'] for c in children), scanned_at)
     cache_save()
+    return True
+
+
+def _propagate_size(key: str, new_size: int, scanned_at: float):
+    """Update key's size inside cached ancestor entries (caller holds _cache_lock)."""
+    child = key
+    parent = os.path.dirname(child)
+    while parent != child:
+        entry = _cache.get(parent)
+        if not entry or entry.get('scanned_at', 0) > scanned_at:
+            return
+        item = next((c for c in entry['children']
+                     if c.get('isDir') and _cache_key(c['path']) == child), None)
+        if item is None or item['size'] == new_size:
+            return
+        # Build a new list (don't mutate one a stream may be iterating)
+        children = [dict(c, size=new_size) if c is item else c for c in entry['children']]
+        children.sort(key=lambda c: -c['size'])
+        entry['children'] = children
+        new_size = sum(c['size'] for c in children)
+        child, parent = parent, os.path.dirname(parent)
 
 
 def cache_delete(path: str):
     with _cache_lock:
-        _cache.pop(path, None)
+        _cache.pop(_cache_key(path), None)
     cache_save()
 
 
@@ -162,8 +202,9 @@ def schedule_prefetch(children: list):
 
 def _do_prefetch(path: str):
     try:
+        started = time.time()
         children = scan_to_list(path)
-        cache_set(path, children)
+        cache_set(path, children, scanned_at=started)
         # One more level deep
         schedule_prefetch(children)
     finally:
@@ -193,17 +234,32 @@ def stream_directory(path: str, write_event, force: bool = False):
         })
         for child in cached['children']:
             write_event({'type': 'child', **child})
-        write_event({'type': 'done'})
 
-        # Silent background refresh
-        def refresh():
-            new_children = scan_to_list(path)
-            cache_set(path, new_children)
-            schedule_prefetch(new_children)
-        threading.Thread(target=refresh, daemon=True).start()
+        if time.time() - cached['scanned_at'] < CACHE_TTL:
+            write_event({'type': 'done'})
+            return
+
+        # Stale: keep the stream open, re-scan, and stream the refreshed listing
+        write_event({'type': 'revalidating'})
+        started = time.time()
+        new_children = scan_to_list(path)
+        cache_set(path, new_children, scanned_at=started)
+        fresh = cache_get(path) or {'children': new_children, 'scanned_at': started}
+        write_event({
+            'type': 'refresh',
+            'path': path,
+            'name': os.path.basename(path) or path,
+            'total_dirs': len(fresh['children']),
+            'scanned_at': fresh['scanned_at'],
+        })
+        for child in fresh['children']:
+            write_event({'type': 'child', **child})
+        write_event({'type': 'done'})
+        schedule_prefetch(fresh['children'])
         return
 
     # Live scan
+    started = time.time()
     try:
         entries = list(os.scandir(path))
     except PermissionError as e:
@@ -244,7 +300,7 @@ def stream_directory(path: str, write_event, force: bool = False):
         write_event({'type': 'child', **loose})
 
     write_event({'type': 'done'})
-    cache_set(path, sorted(collected, key=lambda c: -c['size']))
+    cache_set(path, sorted(collected, key=lambda c: -c['size']), scanned_at=started)
     schedule_prefetch(collected)
 
 
@@ -482,6 +538,8 @@ function startStream(path, force, callbacks) {
     const msg = JSON.parse(e.data);
     if (msg.type === 'start') callbacks.onStart?.(msg);
     if (msg.type === 'child') callbacks.onChild?.(msg);
+    if (msg.type === 'revalidating') callbacks.onRevalidating?.(msg);
+    if (msg.type === 'refresh') callbacks.onRefresh?.(msg);
     if (msg.type === 'done')  { es.close(); activeES=null; callbacks.onDone?.(); }
     if (msg.type === 'error') { es.close(); activeES=null; callbacks.onError?.(msg.error); }
   };
@@ -495,8 +553,8 @@ function navigate(path, force) {
   setProgress(0);
   setScanStatus('scanning…', false);
 
-  const items = [];
-  let meta = null, totalDirs = 0, received = 0;
+  let items = [];
+  let meta = null, totalDirs = 0, received = 0, refreshing = false;
 
   startStream(path, force, {
     onStart(msg) {
@@ -504,18 +562,33 @@ function navigate(path, force) {
       if (msg.from_cache) showCacheBadge(msg.scanned_at);
       render({ path: msg.path, name: msg.name, size: 0, children: [] });
     },
+    onRevalidating() {
+      setProgress(-1);
+      setScanStatus('refreshing…', false);
+    },
+    onRefresh(msg) {
+      // Stale cache was re-scanned: buffer the fresh listing, swap it in on done
+      meta = msg; totalDirs = msg.total_dirs; received = 0;
+      items = []; refreshing = true;
+    },
     onChild(item) {
       received++;
       // Insert sorted by size
       let lo = 0, hi = items.length;
       while (lo < hi) { const mid = (lo+hi)>>1; items[mid].size >= item.size ? lo=mid+1 : hi=mid; }
       items.splice(lo, 0, item);
+      if (refreshing) return;
       const total = items.reduce((s,i) => s+i.size, 0);
       renderData({ path: meta.path, name: meta.name, size: total, children: [...items] });
       if (totalDirs > 0) setProgress(Math.round((received/totalDirs)*100));
       setScanStatus(`${received} / ${totalDirs}`, false);
     },
     onDone() {
+      if (refreshing) {
+        hideCacheBadge();
+        const total = items.reduce((s,i) => s+i.size, 0);
+        renderData({ path: meta.path, name: meta.name, size: total, children: [...items] });
+      }
       setProgress(100);
       setScanStatus('done ✓', true);
       setTimeout(() => { setProgress(-1); setScanStatus('', true); }, 1500);

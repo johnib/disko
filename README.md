@@ -87,7 +87,7 @@ python3 disko.py --path /data --no-browser
 | Version control | git-ignored by default |
 | Clear cache | `rm ~/.disko_cache.json` |
 
-The cache stores one entry per scanned root path. Entries are keyed by absolute path and include a timestamp used to determine staleness.
+The cache stores one entry per scanned directory, keyed by normalized absolute path, with the time the scan started. Cached results are shown instantly. If an entry is older than `CACHE_TTL` (5 minutes by default), disko keeps the connection open, rescans the folder in the background, and swaps in the fresh results when the rescan finishes. When a folder is rescanned, its new size is also written into the cached entries of its parent folders. A scan never overwrites an entry written by a scan that started later.
 
 ---
 
