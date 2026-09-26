@@ -14,9 +14,9 @@
 
 ## Features
 
-- **Parallel scanning** — sizes each subfolder with up to 12 concurrent `du` processes per scan for fast results on large trees
+- **Parallel scanning** — sizes subfolders with up to 12 concurrent `du` processes (a global cap shared by all scans and prefetches) for fast results on large trees
 - **Real-time streaming** — directory sizes stream to the browser live via Server-Sent Events (SSE) as the scan progresses
-- **Persistent cache with background refresh** — previously scanned folders load instantly from the cache, then are silently re-scanned in the background without blocking the UI
+- **Persistent cache with background refresh** — previously scanned folders load instantly from the cache; entries older than 5 minutes are then silently re-scanned in the background without blocking the UI
 - **Zoomable D3.js treemap** — navigate disk usage visually; click any node to zoom in and explore
 - **Breadcrumb navigation** — always know where you are in the tree and jump back to any ancestor in one click
 - **Per-folder refresh** — re-scan any individual folder on demand without restarting the server
@@ -72,11 +72,11 @@ python3 disko.py --path /data --no-browser
 
 ## How It Works
 
-1. **Scanning** — disko lists the immediate children of the current folder. Each subfolder is sized by running `du -sk` (staying on one filesystem) in a `concurrent.futures.ThreadPoolExecutor` with 12 workers per scan. Loose files directly in the folder are summed with `stat` and shown as a single "(loose files)" tile.
-2. **Streaming** — as each subfolder is sized, the result is pushed to the browser over an SSE (`text/event-stream`) connection so the treemap updates in real time.
+1. **Scanning** — disko lists the immediate children of the current folder. Each subfolder is sized by running `du -sk` (staying on one filesystem) in a `concurrent.futures.ThreadPoolExecutor`; at most 12 `du` processes run at once across all live scans and background prefetches. The server handles requests concurrently, so a long scan does not block page loads or other requests, and if the browser disconnects mid-scan the remaining work is cancelled and the partial result is not cached. Loose files directly in the folder are summed with `stat` and shown as a single "(loose files)" tile.
+2. **Streaming** — as each subfolder is sized, the result is pushed to the browser over an SSE (`text/event-stream`) connection so the treemap updates in real time. While waiting on slow `du` calls, a `: keepalive` SSE comment is sent every 2 seconds (ignored by the browser) so a closed tab is noticed quickly.
 3. **Visualization** — the browser renders an interactive, zoomable treemap using [D3.js](https://d3js.org/). Node area is proportional to disk usage.
-4. **Prefetch** — after a scan, the 10 largest subfolders are scanned in the background by a shared pool of 4 prefetch workers (and so on recursively), so drilling down is usually instant.
-5. **Cache** — every completed folder scan is stored in `~/.disko_cache.json`. When you open a cached folder, the cached result is served immediately and the folder is re-scanned in the background to update the cache.
+4. **Prefetch** — after a scan, the 10 largest subfolders are scanned in the background by a shared pool of 4 prefetch workers (one level deep only, and never the same folder twice at once), so drilling down is usually instant.
+5. **Cache** — every completed folder scan is stored in `~/.disko_cache.json`. When you open a cached folder, the cached result is served immediately; if the entry is more than 5 minutes old, the folder is also re-scanned in the background to update the cache.
 
 ---
 

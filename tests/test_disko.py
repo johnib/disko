@@ -12,7 +12,6 @@ import tempfile
 import threading
 import time
 import unittest
-from http.server import HTTPServer
 
 # Point the cache at a throwaway file *before* importing disko, so the real
 # ~/.disko_cache.json is never read or written by the test run.
@@ -236,12 +235,86 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
         self.assertFalse(os.path.exists(disko.CACHE_FILE))
 
 
+class TestBoundedScanning(TempTreeMixin, unittest.TestCase):
+    def test_server_is_threaded(self):
+        self.assertTrue(issubclass(disko.Server, disko.ThreadingHTTPServer))
+        self.assertTrue(disko.Server.daemon_threads)
+
+    def test_prefetch_depth_is_bounded(self):
+        # big/ has a nested/ child: with PREFETCH_MAX_DEPTH == 1 only big/ (and
+        # small/) get prefetched, never big/nested/.
+        self.assertEqual(disko.PREFETCH_MAX_DEPTH, 1)
+        events = []
+        disko.stream_directory(self.root, events.append)
+        _wait_for_prefetch()
+        self.assertIsNotNone(disko.cache_get(self.root))
+        self.assertIsNotNone(disko.cache_get(os.path.join(self.root, 'big')))
+        self.assertIsNone(disko.cache_get(os.path.join(self.root, 'big', 'nested')))
+
+    def test_schedule_prefetch_depth_zero_is_noop(self):
+        disko.schedule_prefetch([{'path': os.path.join(self.root, 'big'), 'isDir': True, 'size': 1}], depth=0)
+        with disko._prefetch_lock:
+            self.assertEqual(disko._prefetching, set())
+
+    def test_submit_scan_dedupes_in_flight(self):
+        p = os.path.join(self.root, 'big')
+        with disko._prefetch_lock:
+            disko._prefetching.add(p)
+        try:
+            self.assertFalse(disko.submit_scan(p))
+        finally:
+            with disko._prefetch_lock:
+                disko._prefetching.discard(p)
+
+    def _cache_hit_refreshes(self, age):
+        disko.cache_set(self.root, [])
+        with disko._cache_lock:
+            disko._cache[self.root]['scanned_at'] = time.time() - age
+        calls = []
+        orig = disko.submit_scan
+        disko.submit_scan = lambda path, depth=0: calls.append((path, depth)) or True
+        try:
+            events = []
+            disko.stream_directory(self.root, events.append)
+        finally:
+            disko.submit_scan = orig
+        self.assertTrue(events[0]['from_cache'])
+        self.assertEqual(events[-1]['type'], 'done')
+        return calls
+
+    def test_fresh_cache_hit_does_not_refresh(self):
+        self.assertEqual(self._cache_hit_refreshes(0), [])
+
+    def test_stale_cache_hit_refreshes_once(self):
+        calls = self._cache_hit_refreshes(disko.REFRESH_MIN_AGE + 10)
+        self.assertEqual(calls, [(self.root, disko.PREFETCH_MAX_DEPTH)])
+
+    def test_disconnect_does_not_cache_partial_results(self):
+        stop = threading.Event()
+        events = []
+
+        def write_event(data):
+            events.append(data)
+            stop.set()  # client "disconnects" right after the start event
+
+        disko.stream_directory(self.root, write_event, stop=stop)
+        self.assertEqual(events[0]['type'], 'start')
+        self.assertNotIn({'type': 'done'}, events)
+        self.assertIsNone(disko.cache_get(self.root))
+
+    def test_du_bounded_skips_when_stopped(self):
+        stop = threading.Event()
+        stop.set()
+        self.assertEqual(disko.du_bounded(os.path.join(self.root, 'big'), stop), 0)
+        self.assertGreater(disko.du_bounded(os.path.join(self.root, 'big')), 0)
+
+
 class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
     def setUp(self):
         super(TestHTTPSmoke, self).setUp()
         self._orig_default = disko._default_path
         disko._default_path = self.root
-        self.server = HTTPServer(('127.0.0.1', 0), disko.Handler)
+        self.server = disko.Server(('127.0.0.1', 0), disko.Handler)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -270,6 +343,8 @@ class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
         events = []
         for block in body.decode('utf-8').split('\n\n'):
             block = block.strip()
+            if block.startswith(':'):  # SSE comment (keepalive heartbeat)
+                continue
             if block:
                 self.assertTrue(block.startswith('data: '), block)
                 events.append(json.loads(block[len('data: '):]))
