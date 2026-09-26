@@ -2,15 +2,17 @@
 """
 disko -- interactive disk usage explorer
 Runs a local web server with a real-time D3.js treemap of your filesystem.
-Usage: python3 disko.py [--port PORT] [--path PATH] [--no-browser]
+Usage: python3 disko.py [--port PORT] [--path PATH] [--no-browser] [--verbose]
 """
 
 import argparse
 import concurrent.futures
+import errno
 import json
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,6 +22,7 @@ from urllib.parse import urlparse, parse_qs
 
 __version__ = "1.0.0"
 _default_path = "/"
+_verbose = False  # --verbose: log HTTP requests
 
 SCAN_WORKERS = 12   # parallel du workers per scan
 PREFETCH_WORKERS = 4  # background prefetch workers
@@ -266,34 +269,66 @@ def _cacheable(children) -> bool:
     return children is not None and all(c.get('size') is not None for c in children)
 
 
-def scan_to_list(path: str):
-    """Scan path and return list of child dicts, or None if it can't be read."""
-    path = _resolve_scan_path(path)
-    try:
-        entries = list(os.scandir(path))
-    except OSError:
-        return None
+def _list_entries(path: str):
+    """Return (subdirs, loose file total) for path. Raises OSError if it can't be listed.
 
+    Loose files are measured by allocated size (_alloc_size), like du."""
+    entries = list(os.scandir(path))
     dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
-    files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
+    file_total = sum(_alloc_size(e) for e in entries if not e.is_dir(follow_symlinks=False))
+    return dirs, file_total
 
-    file_total = sum(_alloc_size(e) for e in files)
+
+def _iter_children(path: str, dirs: list, file_total: int, stop=None):
+    """Yield path's child dicts: mount points first (never du'ed), then each subdir
+    as its du completes, then the "(loose files)" entry.
+
+    Yields None every HEARTBEAT_SECS while waiting on du, so a streaming caller can
+    send a keepalive (and notice a disconnected client). If `stop` gets set, queued
+    du calls are skipped and iteration ends early without the loose-files entry.
+    Pending du work is cancelled when the generator is closed or exhausted.
+    """
     dirs, mounts = _split_mounts(path, dirs)
-
-    children = [_mount_child(e) for e in mounts]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
-        futures = {ex.submit(du_bounded, e.path): e for e in dirs}
-        for fut in concurrent.futures.as_completed(futures):
-            children.append(_dir_child(futures[fut], fut.result()))
+    for e in mounts:
+        yield _mount_child(e)
+    # Not a `with` block: its exit would wait for every running du after a disconnect
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS)
+    futures = {ex.submit(du_bounded, e.path, stop): e for e in dirs}
+    pending = set(futures)
+    try:
+        while pending and not (stop is not None and stop.is_set()):
+            done, pending = concurrent.futures.wait(
+                pending, timeout=HEARTBEAT_SECS,
+                return_when=concurrent.futures.FIRST_COMPLETED)
+            if not done:
+                yield None
+            for fut in done:
+                yield _dir_child(futures[fut], fut.result())
+    finally:
+        for f in pending:  # manual cancel_futures (Python 3.8 compatible)
+            f.cancel()
+        ex.shutdown(wait=False)
+    if stop is not None and stop.is_set():
+        return
 
     if file_total > 0:
-        children.append({
+        yield {
             'name': '(loose files)',
             'path': path,
             'size': file_total,
             'isDir': False,
-        })
+        }
 
+
+def scan_to_list(path: str):
+    """Scan path and return list of child dicts, or None if it can't be read."""
+    path = _resolve_scan_path(path)
+    try:
+        dirs, file_total = _list_entries(path)
+    except OSError:
+        return None
+
+    children = [c for c in _iter_children(path, dirs, file_total) if c is not None]
     children.sort(key=_size_key)
     return children
 
@@ -303,23 +338,49 @@ def scan_to_list(path: str):
 _prefetch_pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=PREFETCH_WORKERS, thread_name_prefix='prefetch')
 _prefetching: set = set()
+_prefetch_futures: set = set()  # pending/running prefetch futures (for shutdown)
 _prefetch_lock = threading.Lock()
 
 
 def submit_scan(path: str, depth: int = 0) -> bool:
     """Scan path in the background (deduped against in-flight scans), then
-    prefetch `depth` levels of its children. Returns False if already running."""
+    prefetch `depth` levels of its children. Returns False if already running
+    or the pool has been shut down (Ctrl+C / interpreter exit)."""
     with _prefetch_lock:
         if path in _prefetching:
             return False
         _prefetching.add(path)
     try:
-        _prefetch_pool.submit(_do_prefetch, path, depth)
-    except RuntimeError:  # pool shut down (interpreter exiting)
+        fut = _prefetch_pool.submit(_do_prefetch, path, depth)
+    except RuntimeError:  # pool already shut down
         with _prefetch_lock:
             _prefetching.discard(path)
         return False
+    with _prefetch_lock:
+        _prefetch_futures.add(fut)
+    fut.add_done_callback(lambda f: _prefetch_done(path, f))
     return True
+
+
+def _prefetch_done(path: str, fut):
+    with _prefetch_lock:
+        _prefetch_futures.discard(fut)
+        if fut.cancelled():  # _do_prefetch never ran, so its finally didn't clean up
+            _prefetching.discard(path)
+    if fut.cancelled():
+        return
+    exc = fut.exception()
+    if exc is not None:
+        print(f'  Prefetch error for {path}: {exc!r}', file=sys.stderr)
+
+
+def stop_prefetch():
+    """Cancel queued prefetch scans and stop accepting new ones."""
+    with _prefetch_lock:
+        pending = list(_prefetch_futures)
+    for fut in pending:
+        fut.cancel()
+    _prefetch_pool.shutdown(wait=False)
 
 
 def schedule_prefetch(children: list, depth: int = PREFETCH_MAX_DEPTH):
@@ -439,18 +500,14 @@ def stream_directory(path: str, write_event, force: bool = False, stop=None):
     # Live scan
     started = time.time()
     try:
-        entries = list(os.scandir(path))
+        dirs, file_total = _list_entries(path)
     except OSError as e:
         write_event({'type': 'error', 'error': str(e)})
         return
 
-    dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
-    files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
-    file_total = sum(_alloc_size(e) for e in files)
     # Counted before the mount split (mounts are emitted as children too), +1 for the
     # "(loose files)" entry sent after the dirs, so progress never exceeds 100%.
     total_dirs = len(dirs) + (1 if file_total > 0 else 0)
-    dirs, mounts = _split_mounts(path, dirs)
 
     write_event({
         'type': 'start',
@@ -460,36 +517,19 @@ def stream_directory(path: str, write_event, force: bool = False, stop=None):
         'from_cache': False,
     })
 
-    # Mount points are not du'ed (other filesystem); emit them first.
-    collected = [_mount_child(e) for e in mounts]
-    for child in collected:
-        write_event({'type': 'child', **child})
-    # Not a `with` block: its exit would wait for every running du after a disconnect
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS)
-    futures = {ex.submit(du_bounded, e.path, stop): e for e in dirs}
-    pending = set(futures)
+    collected = []
+    children = _iter_children(path, dirs, file_total, stop)
     try:
-        while pending and not stop.is_set():
-            done, pending = concurrent.futures.wait(
-                pending, timeout=HEARTBEAT_SECS,
-                return_when=concurrent.futures.FIRST_COMPLETED)
-            if not done:
+        for child in children:
+            if child is None:
                 write_event(None)  # heartbeat: detects a disconnected client
-            for fut in done:
-                child = _dir_child(futures[fut], fut.result())
-                collected.append(child)
-                write_event({'type': 'child', **child})
+                continue
+            collected.append(child)
+            write_event({'type': 'child', **child})
     finally:
-        for f in pending:  # manual cancel_futures (Python 3.8 compatible)
-            f.cancel()
-        ex.shutdown(wait=False)
+        children.close()  # cancels queued du calls if we bail out early
     if stop.is_set():
         return  # client went away: don't cache partial results
-
-    if file_total > 0:
-        loose = {'name': '(loose files)', 'path': path, 'size': file_total, 'isDir': False}
-        collected.append(loose)
-        write_event({'type': 'child', **loose})
 
     write_event({'type': 'done'})
     if _cacheable(collected):
@@ -1017,7 +1057,7 @@ function goBack() {
   cancelStream();
   const prev = navStack.pop();
   currentData = prev;
-  renderFull(prev);
+  render(prev);
 }
 
 function goToPath() {
@@ -1064,12 +1104,6 @@ function renderData(data) {
   renderSidebar(data);
   renderTreemap(data);
   document.querySelector('#total-size span').textContent = fmt(data.size);
-}
-
-function renderFull(data) {
-  render(data);
-  renderBreadcrumb();
-  document.getElementById('back-btn').classList.toggle('visible', navStack.length > 0);
 }
 
 // Build an element with textContent only (never innerHTML) so untrusted names can't inject markup.
@@ -1404,8 +1438,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    def log_message(self, *args):
-        pass
+    def log_message(self, format, *args):
+        if _verbose:
+            super().log_message(format, *args)
 
 
 class Server(ThreadingHTTPServer):
@@ -1415,24 +1450,34 @@ class Server(ThreadingHTTPServer):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global _default_path, DU_TIMEOUT
+    global _default_path, _verbose, DU_TIMEOUT
     parser = argparse.ArgumentParser(prog="disko", description="disko - interactive disk usage explorer")
     parser.add_argument("--port", type=int, default=8765, help="Port (default: 8765)")
     parser.add_argument("--path", type=str, default=None, help="Starting path (default: your home directory)")
     parser.add_argument("--no-browser", action="store_true", help="Do not open browser")
     parser.add_argument("--du-timeout", type=float, default=DU_TIMEOUT,
                         help="Seconds before a single du call is abandoned (default: %d)" % DU_TIMEOUT)
+    parser.add_argument("--verbose", action="store_true", help="Log HTTP requests to stderr")
     args = parser.parse_args()
     if args.du_timeout <= 0:
         parser.error("--du-timeout must be positive")
     DU_TIMEOUT = args.du_timeout
+    _verbose = args.verbose
     if args.path:
         _default_path = norm_path(args.path)
     else:
         _default_path = os.path.expanduser("~")
     port = args.port
+    try:
+        server = Server(("localhost", port), Handler)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            print(f"  Error: port {port} is already in use (another disko instance?).\n"
+                  f"  Try a different port, e.g.: disko --port {port + 1}", file=sys.stderr)
+        else:
+            print(f"  Error: could not start server on localhost:{port}: {e.strerror or e}", file=sys.stderr)
+        sys.exit(1)
     cache_load()
-    server = Server(("localhost", port), Handler)
     url = f"http://localhost:{port}"
     print(f"  disko v{__version__} -> {url}")
     print(f"  Cache: {CACHE_FILE}")
@@ -1442,7 +1487,11 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("Stopped.")
+        print("\n  Shutting down...")
+    finally:
+        stop_prefetch()
+        server.server_close()
+    print("  Stopped.")
 
 
 if __name__ == "__main__":
