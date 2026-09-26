@@ -120,15 +120,21 @@ def _sound_child(c) -> bool:
     child's 'path' straight into _cache_key -> os.path.expanduser (TypeError on non-str,
     e.g. None), and both _size_key's sort and _propagate_size's own size-summing negate/
     add every child's 'size' -- TypeError on a non-numeric value, and a silently wrong
-    (NaN/inf-poisoned) ancestor total from a non-finite one. 'size' is None for a du
-    failure/timeout in the real app, never any other non-number."""
+    (NaN/inf-poisoned, or negative -- no allocated size the app itself produces is ever
+    negative) ancestor total otherwise. 'size' is None for a du failure/timeout in the
+    real app, never any other non-number. 'fileType', if present, is always a plain str
+    bucket key (see FILE_TYPE_EXTENSIONS) -- a non-string value here (or elsewhere in an
+    unanticipated field) would otherwise only be caught later, if at all, by the SSE
+    writer's allow_nan=False JSON guard (see do_GET's write_event)."""
     if not isinstance(c, dict):
         return False
     size = c.get('size')
+    file_type = c.get('fileType')
     return (isinstance(c.get('name'), str)
             and isinstance(c.get('path'), str)
             and isinstance(c.get('isDir'), bool)
-            and (size is None or _finite_number(size)))
+            and (size is None or (_finite_number(size) and size >= 0))
+            and (file_type is None or isinstance(file_type, str)))
 
 
 def _sound_entry(entry) -> bool:
@@ -1859,7 +1865,14 @@ class Handler(BaseHTTPRequestHandler):
                     if data is None:  # SSE comment, ignored by EventSource
                         self.wfile.write(b": keepalive\n\n")
                     else:
-                        self.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
+                        # allow_nan=False: Python's json.dumps emits bare NaN/Infinity by
+                        # default (a non-standard extension), which the browser's strict
+                        # JSON.parse rejects -- turn that into a clean, reported scan
+                        # failure (caught by do_GET's wrapper below) instead of silently
+                        # shipping unparseable SSE data. Defense in depth alongside the
+                        # cache validators (_sound_child/_sound_entry), which should
+                        # already keep a non-finite value out of anything reaching here.
+                        self.wfile.write(f"data: {json.dumps(data, allow_nan=False)}\n\n".encode())
                     self.wfile.flush()
                 except OSError:  # BrokenPipe, ConnectionReset, etc.
                     stop.set()

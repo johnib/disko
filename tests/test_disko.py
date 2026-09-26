@@ -525,6 +525,26 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
             self.assertFalse(disko._sound_child(
                 {'name': 'x', 'path': '/x', 'size': bad_size, 'isDir': True}), bad_size)
 
+    def test_negative_child_size_rejected(self):
+        # No allocated size the app itself ever produces is negative; a negative value
+        # would otherwise reduce a propagated ancestor total and vanish from the UI via
+        # hasSizeInfo's `size > 0` check, with no visible sign anything is wrong.
+        self.assertFalse(disko._sound_child({'name': 'x', 'path': '/x', 'size': -1, 'isDir': True}))
+
+    def test_non_string_file_type_rejected(self):
+        # 'fileType' is always a plain str bucket key in the real app (see
+        # FILE_TYPE_EXTENSIONS); a non-finite float here would otherwise only be caught,
+        # if at all, by the SSE writer's allow_nan=False JSON guard -- reject it at the
+        # cache-validation boundary instead, where every other field is already checked.
+        for bad_file_type in (float('nan'), float('inf'), 123, True):
+            self.assertFalse(disko._sound_child(
+                {'name': 'x', 'path': '/x', 'size': 1, 'isDir': False, 'fileType': bad_file_type}),
+                bad_file_type)
+        # A real bucket key (or no fileType at all) must still be accepted.
+        self.assertTrue(disko._sound_child(
+            {'name': 'x', 'path': '/x', 'size': 1, 'isDir': False, 'fileType': 'image'}))
+        self.assertTrue(disko._sound_child({'name': 'x', 'path': '/x', 'size': 1, 'isDir': True}))
+
     def test_oversized_integer_treated_as_miss_not_crash(self):
         # math.isfinite() itself raises OverflowError on an arbitrarily large Python int
         # (json.load decodes JSON integers with unlimited precision, so a hand-edited
