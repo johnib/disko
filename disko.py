@@ -2,15 +2,17 @@
 """
 disko -- interactive disk usage explorer
 Runs a local web server with a real-time D3.js treemap of your filesystem.
-Usage: python3 disko.py [--port PORT] [--path PATH] [--no-browser]
+Usage: python3 disko.py [--port PORT] [--path PATH] [--no-browser] [--verbose]
 """
 
 import argparse
 import concurrent.futures
+import errno
 import json
 import os
 import platform
 import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -19,6 +21,7 @@ from urllib.parse import urlparse, parse_qs
 
 __version__ = "1.0.0"
 _default_path = "/"
+_verbose = False  # --verbose: log HTTP requests
 
 SCAN_WORKERS = 12   # parallel du workers per scan
 PREFETCH_WORKERS = 4  # background prefetch workers
@@ -89,44 +92,50 @@ def du_single(path: str) -> int:
     return 0
 
 
+def _list_entries(path: str):
+    """Return (subdirs, loose file total) for path. Raises OSError on scandir failure."""
+    entries = list(os.scandir(path))
+    dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
+    files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
+    file_total = sum(
+        e.stat(follow_symlinks=False).st_size for e in files if _safe_stat(e)
+    )
+    return dirs, file_total
+
+
+def _iter_children(path: str, dirs: list, file_total: int):
+    """Yield child dicts as each subdir's du completes, then the loose-files entry."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+        futures = {ex.submit(du_single, e.path): e for e in dirs}
+        for fut in concurrent.futures.as_completed(futures):
+            entry = futures[fut]
+            yield {
+                'name': entry.name,
+                'path': entry.path,
+                'size': fut.result(),
+                'isDir': True,
+            }
+
+    if file_total > 0:
+        yield {
+            'name': '(loose files)',
+            'path': path,
+            'size': file_total,
+            'isDir': False,
+        }
+
+
 def scan_to_list(path: str) -> list:
     """Scan path and return list of child dicts."""
     path = os.path.normpath(os.path.expanduser(path))
     if not os.path.isdir(path):
         return []
     try:
-        entries = list(os.scandir(path))
+        dirs, file_total = _list_entries(path)
     except PermissionError:
         return []
 
-    dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
-    files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
-
-    file_total = sum(
-        e.stat(follow_symlinks=False).st_size for e in files
-        if _safe_stat(e)
-    )
-
-    children = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
-        futures = {ex.submit(du_single, e.path): e for e in dirs}
-        for fut in concurrent.futures.as_completed(futures):
-            entry = futures[fut]
-            children.append({
-                'name': entry.name,
-                'path': entry.path,
-                'size': fut.result(),
-                'isDir': True,
-            })
-
-    if file_total > 0:
-        children.append({
-            'name': '(loose files)',
-            'path': path,
-            'size': file_total,
-            'isDir': False,
-        })
-
+    children = list(_iter_children(path, dirs, file_total))
     children.sort(key=lambda c: -c['size'])
     return children
 
@@ -144,6 +153,7 @@ def _safe_stat(entry):
 _prefetch_pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=PREFETCH_WORKERS, thread_name_prefix='prefetch')
 _prefetching: set = set()
+_prefetch_futures: set = set()  # pending/running prefetch futures (for shutdown)
 _prefetch_lock = threading.Lock()
 
 
@@ -157,7 +167,38 @@ def schedule_prefetch(children: list):
             if p in _prefetching or cache_get(p):
                 continue
             _prefetching.add(p)
-        _prefetch_pool.submit(_do_prefetch, p)
+        _submit_prefetch(p)
+
+
+def _submit_prefetch(path: str):
+    try:
+        fut = _prefetch_pool.submit(_do_prefetch, path)
+    except RuntimeError:  # pool already shut down (Ctrl+C)
+        with _prefetch_lock:
+            _prefetching.discard(path)
+        return
+    with _prefetch_lock:
+        _prefetch_futures.add(fut)
+    fut.add_done_callback(lambda f: _prefetch_done(path, f))
+
+
+def _prefetch_done(path: str, fut):
+    with _prefetch_lock:
+        _prefetch_futures.discard(fut)
+    if fut.cancelled():
+        return
+    exc = fut.exception()
+    if exc is not None:
+        print(f'  Prefetch error for {path}: {exc!r}', file=sys.stderr)
+
+
+def stop_prefetch():
+    """Cancel queued prefetch scans and stop accepting new ones."""
+    with _prefetch_lock:
+        pending = list(_prefetch_futures)
+    for fut in pending:
+        fut.cancel()
+    _prefetch_pool.shutdown(wait=False)
 
 
 def _do_prefetch(path: str):
@@ -205,16 +246,10 @@ def stream_directory(path: str, write_event, force: bool = False):
 
     # Live scan
     try:
-        entries = list(os.scandir(path))
+        dirs, file_total = _list_entries(path)
     except PermissionError as e:
         write_event({'type': 'error', 'error': str(e)})
         return
-
-    dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
-    files = [e for e in entries if not e.is_dir(follow_symlinks=False)]
-    file_total = sum(
-        e.stat(follow_symlinks=False).st_size for e in files if _safe_stat(e)
-    )
 
     write_event({
         'type': 'start',
@@ -225,23 +260,9 @@ def stream_directory(path: str, write_event, force: bool = False):
     })
 
     collected = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
-        futures = {ex.submit(du_single, e.path): e for e in dirs}
-        for fut in concurrent.futures.as_completed(futures):
-            entry = futures[fut]
-            child = {
-                'name': entry.name,
-                'path': entry.path,
-                'size': fut.result(),
-                'isDir': True,
-            }
-            collected.append(child)
-            write_event({'type': 'child', **child})
-
-    if file_total > 0:
-        loose = {'name': '(loose files)', 'path': path, 'size': file_total, 'isDir': False}
-        collected.append(loose)
-        write_event({'type': 'child', **loose})
+    for child in _iter_children(path, dirs, file_total):
+        collected.append(child)
+        write_event({'type': 'child', **child})
 
     write_event({'type': 'done'})
     cache_set(path, sorted(collected, key=lambda c: -c['size']))
@@ -399,7 +420,6 @@ body {
 .tt-path { font-size: 11px; color: #475569; margin-bottom: 8px; word-break: break-all; }
 .tt-size { font-size: 18px; font-weight: 700; color: #e94560; }
 .tt-pct  { font-size: 11px; color: #64748b; margin-top: 2px; }
-.tt-cached { font-size: 10px; color: #334155; margin-top: 4px; }
 .tt-hint { margin-top: 8px; font-size: 11px; color: #334155; border-top: 1px solid #2d3748; padding-top: 7px; }
 </style>
 </head>
@@ -555,7 +575,7 @@ function goBack() {
   if (!navStack.length) return;
   const prev = navStack.pop();
   currentData = prev;
-  renderFull(prev);
+  render(prev);
 }
 
 function goToPath() {
@@ -587,12 +607,6 @@ function renderData(data) {
   document.querySelector('#total-size span').textContent = fmt(data.size);
 }
 
-function renderFull(data) {
-  render(data);
-  renderBreadcrumb();
-  document.getElementById('back-btn').classList.toggle('visible', navStack.length > 0);
-}
-
 function renderBreadcrumb() {
   const bc = document.getElementById('breadcrumb');
   bc.innerHTML = '';
@@ -603,7 +617,7 @@ function renderBreadcrumb() {
     span.className = 'crumb' + (i === chain.length-1 ? ' active' : '');
     span.title = item.path;
     span.textContent = name;
-    if (i < chain.length-1) span.onclick = () => { navStack = navStack.slice(0,i); renderFull(item); };
+    if (i < chain.length-1) span.onclick = () => { navStack = navStack.slice(0,i); render(item); };
     bc.appendChild(span);
     if (i < chain.length-1) {
       const sep = document.createElement('span'); sep.className='crumb-sep'; sep.textContent=' › ';
@@ -803,19 +817,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    def log_message(self, *args):
-        pass
+    def log_message(self, format, *args):
+        if _verbose:
+            super().log_message(format, *args)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global _default_path
+    global _default_path, _verbose
     parser = argparse.ArgumentParser(prog="disko", description="disko - interactive disk usage explorer")
     parser.add_argument("--port", type=int, default=8765, help="Port (default: 8765)")
     parser.add_argument("--path", type=str, default=None, help="Starting path (auto-detected if omitted)")
     parser.add_argument("--no-browser", action="store_true", help="Do not open browser")
+    parser.add_argument("--verbose", action="store_true", help="Log HTTP requests to stderr")
     args = parser.parse_args()
+    _verbose = args.verbose
     if args.path:
         _default_path = os.path.normpath(os.path.expanduser(args.path))
     elif platform.system() == "Darwin":
@@ -823,8 +840,16 @@ def main():
     else:
         _default_path = os.path.expanduser("~")
     port = args.port
+    try:
+        server = HTTPServer(("localhost", port), Handler)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            print(f"  Error: port {port} is already in use (another disko instance?).\n"
+                  f"  Try a different port, e.g.: disko --port {port + 1}", file=sys.stderr)
+        else:
+            print(f"  Error: could not start server on localhost:{port}: {e.strerror or e}", file=sys.stderr)
+        sys.exit(1)
     cache_load()
-    server = HTTPServer(("localhost", port), Handler)
     url = f"http://localhost:{port}"
     print(f"  disko v{__version__} -> {url}")
     print(f"  Cache: {CACHE_FILE}")
@@ -834,7 +859,11 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("Stopped.")
+        print("\n  Shutting down...")
+    finally:
+        stop_prefetch()
+        server.server_close()
+    print("  Stopped.")
 
 
 if __name__ == "__main__":
