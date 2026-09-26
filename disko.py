@@ -813,13 +813,11 @@ def main():
     global _default_path
     parser = argparse.ArgumentParser(prog="disko", description="disko - interactive disk usage explorer")
     parser.add_argument("--port", type=int, default=8765, help="Port (default: 8765)")
-    parser.add_argument("--path", type=str, default=None, help="Starting path (auto-detected if omitted)")
+    parser.add_argument("--path", type=str, default=None, help="Starting path (default: your home directory)")
     parser.add_argument("--no-browser", action="store_true", help="Do not open browser")
     args = parser.parse_args()
     if args.path:
         _default_path = os.path.normpath(os.path.expanduser(args.path))
-    elif platform.system() == "Darwin":
-        _default_path = "/System/Volumes/Data"
     else:
         _default_path = os.path.expanduser("~")
     port = args.port
