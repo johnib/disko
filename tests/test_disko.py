@@ -115,18 +115,41 @@ class TempTreeMixin(object):
             disko._cache.clear()
 
     def tearDown(self):
-        # Join background refresh threads (e.g. after a cache hit) so they
-        # cannot write into the next test's state, then drain prefetches.
-        for t in set(threading.enumerate()) - self._threads_before:
-            if not t.name.startswith('prefetch'):
-                t.join(5)
-        _wait_for_prefetch()
-        with disko._cache_lock:
-            disko._cache.clear()
-        disko.CACHE_FILE = self._orig_cache_file
-        disko._persist_cache = self._orig_persist
-        shutil.rmtree(self.cache_dir, ignore_errors=True)
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        try:
+            # Join background refresh threads (e.g. after a cache hit) so they
+            # cannot write into the next test's state, then drain prefetches.
+            #
+            # A just-created thread can appear in threading.enumerate() (via
+            # CPython's internal _limbo bookkeeping) slightly before its own
+            # start() call -- running concurrently on another thread -- has
+            # finished marking it started, so join() can raise "cannot join
+            # thread before it is started" even though start() was already
+            # invoked. Retry once after a brief pause rather than letting that
+            # narrow race abort teardown (which would skip restoring the
+            # globals below and corrupt state for every later test).
+            for t in set(threading.enumerate()) - self._threads_before:
+                if t.name.startswith('prefetch'):
+                    continue
+                for attempt in range(2):
+                    try:
+                        t.join(5)
+                        break
+                    except RuntimeError:
+                        if attempt:
+                            raise
+                        time.sleep(0.05)
+            _wait_for_prefetch()
+            with disko._cache_lock:
+                disko._cache.clear()
+        finally:
+            # Always restore, even if the joins/prefetch-drain above raised --
+            # otherwise a leaked CACHE_FILE/_persist_cache override corrupts
+            # every test that runs afterward (they read disko's globals, not
+            # per-test instance state), turning one flaky test into a cascade.
+            disko.CACHE_FILE = self._orig_cache_file
+            disko._persist_cache = self._orig_persist
+            shutil.rmtree(self.cache_dir, ignore_errors=True)
+            shutil.rmtree(self.tmp, ignore_errors=True)
 
 
 class TempTypeTreeMixin(TempTreeMixin):
