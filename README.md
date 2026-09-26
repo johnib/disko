@@ -2,7 +2,7 @@
 
 **Interactive disk usage explorer**
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](https://github.com/johnib/disko)
 
@@ -27,7 +27,7 @@
 
 ## Requirements
 
-- Python 3.8 or later
+- Python 3.9 or later
 - macOS or Linux
 - A modern web browser (Chrome, Firefox, Safari, or Edge)
 
