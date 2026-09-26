@@ -1105,7 +1105,8 @@ class Handler(BaseHTTPRequestHandler):
             params = parse_qs(parsed.query, errors='surrogateescape')
             path = params.get('path', [''])[0]
             if path:
-                cache_delete(norm_path(path))
+                # Same resolution as stream_directory, so '/' on macOS clears the Data volume entry.
+                cache_delete(_resolve_scan_path(path))
             self.send_response(200)
             self.end_headers()
 

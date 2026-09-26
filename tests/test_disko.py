@@ -147,12 +147,60 @@ class TestScanToList(TempTreeMixin, unittest.TestCase):
         loose = by_name['(loose files)']
         self.assertFalse(loose['isDir'])
         self.assertEqual(loose['path'], self.root)
-        self.assertEqual(loose['size'], 3000)
+        # Loose files are measured by allocated blocks, like du does for dirs.
+        expected = sum(os.lstat(os.path.join(self.root, n)).st_blocks * 512
+                       for n in ('loose1.txt', 'loose2.txt'))
+        self.assertEqual(loose['size'], expected)
+        self.assertGreaterEqual(loose['size'], 3000)
 
         # Sorted largest first, and 'big' is the largest entry.
         sizes = [c['size'] for c in children]
         self.assertEqual(sizes, sorted(sizes, reverse=True))
         self.assertEqual(children[0]['name'], 'big')
+
+    def test_sparse_file_counts_allocated_blocks(self):
+        sub = os.path.join(self.root, 'small')
+        with open(os.path.join(sub, 'sparse.img'), 'wb') as f:
+            f.truncate(1024 * 1024 * 1024)  # 1 GiB apparent, ~0 allocated
+        children = disko.scan_to_list(sub)
+        loose = [c for c in children if c['name'] == '(loose files)']
+        total = sum(c['size'] for c in loose)
+        self.assertLess(total, 64 * 1024 * 1024)
+
+    def test_mount_points_are_not_dued(self):
+        real_split = disko._split_mounts
+
+        def fake_split(path, dirs):
+            local, mounts = real_split(path, dirs)
+            return ([e for e in local if e.name != 'big'],
+                    mounts + [e for e in local if e.name == 'big'])
+
+        calls = []
+        real_du = disko.du_single
+        disko._split_mounts = fake_split
+        disko.du_single = lambda p: (calls.append(p), real_du(p))[1]
+        try:
+            children = disko.scan_to_list(self.root)
+        finally:
+            disko._split_mounts = real_split
+            disko.du_single = real_du
+        big = [c for c in children if c['name'] == 'big'][0]
+        self.assertEqual(big, {'name': 'big', 'path': os.path.join(self.root, 'big'),
+                               'size': 0, 'isDir': True, 'mount': True})
+        self.assertNotIn(os.path.join(self.root, 'big'), calls)
+        self.assertTrue(disko._cacheable(children))
+
+    def test_resolve_scan_path_macos_root(self):
+        real = disko.platform.system
+        try:
+            disko.platform.system = lambda: 'Darwin'
+            self.assertEqual(disko._resolve_scan_path('/'), '/System/Volumes/Data')
+            self.assertEqual(disko._resolve_scan_path('//'), '/System/Volumes/Data')
+            self.assertEqual(disko._resolve_scan_path('/usr/'), '/usr')
+            disko.platform.system = lambda: 'Linux'
+            self.assertEqual(disko._resolve_scan_path('/'), '/')
+        finally:
+            disko.platform.system = real
 
     def test_scan_normalizes_path(self):
         children = disko.scan_to_list(self.root + os.sep + '.' + os.sep)
