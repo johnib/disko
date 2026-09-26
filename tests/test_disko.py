@@ -284,28 +284,44 @@ class TestBoundedScanning(TempTreeMixin, unittest.TestCase):
             with disko._prefetch_lock:
                 disko._prefetching.discard(p)
 
-    def _cache_hit_refreshes(self, age):
-        disko.cache_set(self.root, [])
-        with disko._cache_lock:
-            disko._cache[self.root]['scanned_at'] = time.time() - age
-        calls = []
-        orig = disko.submit_scan
-        disko.submit_scan = lambda path, depth=0: calls.append((path, depth)) or True
-        try:
-            events = []
-            disko.stream_directory(self.root, events.append)
-        finally:
-            disko.submit_scan = orig
+    def _cache_hit_events(self, age, stop=None):
+        disko.cache_set(self.root, [], scanned_at=time.time() - age)
+        events = []
+
+        def write_event(data):
+            if data is not None:  # skip heartbeats
+                events.append(data)
+        disko.stream_directory(self.root, write_event, stop=stop)
         self.assertTrue(events[0]['from_cache'])
-        self.assertEqual(events[-1]['type'], 'done')
-        return calls
+        return events
 
     def test_fresh_cache_hit_does_not_refresh(self):
-        self.assertEqual(self._cache_hit_refreshes(0), [])
+        events = self._cache_hit_events(0)
+        self.assertEqual([e['type'] for e in events], ['start', 'done'])
 
-    def test_stale_cache_hit_refreshes_once(self):
-        calls = self._cache_hit_refreshes(disko.REFRESH_MIN_AGE + 10)
-        self.assertEqual(calls, [(self.root, disko.PREFETCH_MAX_DEPTH)])
+    def test_stale_cache_hit_revalidates_in_stream(self):
+        stale_at = time.time() - disko.CACHE_TTL - 10
+        events = self._cache_hit_events(disko.CACHE_TTL + 10)
+        types = [e['type'] for e in events]
+        self.assertEqual(types[:2], ['start', 'revalidating'])
+        self.assertEqual(types[2], 'refresh')
+        self.assertEqual(types[-1], 'done')
+        fresh = {e['name']: e for e in events[3:-1]}
+        self.assertGreater(fresh['big']['size'], 0)
+        entry = disko.cache_get(self.root)
+        self.assertGreater(entry['scanned_at'], stale_at)
+        self.assertEqual(events[2]['scanned_at'], entry['scanned_at'])
+        self.assertIn('big', [c['name'] for c in entry['children']])
+
+    def test_stale_revalidate_finishes_after_disconnect(self):
+        stop = threading.Event()
+        stop.set()  # client is already gone once the cached listing is sent
+        events = self._cache_hit_events(disko.CACHE_TTL + 10, stop=stop)
+        self.assertNotIn('refresh', [e['type'] for e in events])
+        deadline = time.time() + 10
+        while time.time() < deadline and not disko.cache_get(self.root)['children']:
+            time.sleep(0.05)
+        self.assertIn('big', [c['name'] for c in disko.cache_get(self.root)['children']])
 
     def test_disconnect_does_not_cache_partial_results(self):
         stop = threading.Event()
@@ -341,6 +357,53 @@ class TestBoundedScanning(TempTreeMixin, unittest.TestCase):
         self.assertTrue(all(k['size'] is None and k['status'] == 'timeout' for k in kids))
         self.assertEqual(events[-1]['type'], 'done')
         self.assertIsNone(disko.cache_get(self.root))
+
+
+class TestCacheStaleness(TempTreeMixin, unittest.TestCase):
+    def test_older_scan_does_not_overwrite_newer(self):
+        self.assertTrue(disko.cache_set(self.root, [], scanned_at=200.0))
+        self.assertFalse(disko.cache_set(self.root, [{'name': 'x', 'path': '/x', 'size': 1, 'isDir': True}],
+                                         scanned_at=100.0))
+        entry = disko.cache_get(self.root)
+        self.assertEqual(entry['children'], [])
+        self.assertEqual(entry['scanned_at'], 200.0)
+
+    def test_keys_are_normalized(self):
+        disko.cache_set(self.root + '/big/', [], scanned_at=1.0)
+        self.assertIsNotNone(disko.cache_get(os.path.join(self.root, 'big')))
+        disko.cache_delete(os.path.join(self.root, 'big', 'nested', '..') + '/')
+        self.assertIsNone(disko.cache_get(os.path.join(self.root, 'big')))
+
+    def test_rescan_size_propagates_to_cached_ancestors(self):
+        big = os.path.join(self.root, 'big')
+        nested = os.path.join(big, 'nested')
+        root_children = [
+            {'name': 'big', 'path': big, 'size': 10, 'isDir': True},
+            {'name': 'small', 'path': os.path.join(self.root, 'small'), 'size': 50, 'isDir': True},
+        ]
+        disko.cache_set(self.root, root_children, scanned_at=100.0)
+        disko.cache_set(big, [{'name': 'nested', 'path': nested, 'size': 5, 'isDir': True},
+                              {'name': '(loose files)', 'path': big, 'size': 5, 'isDir': False}],
+                        scanned_at=100.0)
+        held = disko.cache_get(self.root)['children']  # a stream may be iterating this list
+        disko.cache_set(nested, [{'name': 'deep', 'path': os.path.join(nested, 'deep'), 'size': 95,
+                                  'isDir': True, 'status': 'partial'}], scanned_at=200.0)
+
+        big_entry = disko.cache_get(big)['children']
+        self.assertEqual(big_entry[0]['size'], 95)
+        self.assertEqual(big_entry[0]['status'], 'partial')
+        root_entry = disko.cache_get(self.root)['children']
+        self.assertEqual([c['name'] for c in root_entry], ['big', 'small'])  # re-sorted
+        self.assertEqual(root_entry[0]['size'], 100)
+        self.assertEqual(root_entry[0]['status'], 'partial')
+        self.assertEqual(held[0]['size'], 10)  # old list untouched
+
+    def test_propagation_skips_newer_ancestor(self):
+        big = os.path.join(self.root, 'big')
+        disko.cache_set(self.root, [{'name': 'big', 'path': big, 'size': 10, 'isDir': True}], scanned_at=300.0)
+        disko.cache_set(big, [{'name': 'a', 'path': os.path.join(big, 'a'), 'size': 99, 'isDir': True}],
+                        scanned_at=200.0)
+        self.assertEqual(disko.cache_get(self.root)['children'][0]['size'], 10)
 
 
 class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
