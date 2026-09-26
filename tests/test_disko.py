@@ -381,10 +381,27 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
         disko.cache_load()
         self.assertIsNone(disko.cache_get(self.root))
 
-    def test_non_dict_cache_entry_treated_as_miss(self):
+    def test_dict_entry_missing_children_key_treated_as_miss(self):
+        # A dict entry that carries the current version but is missing 'children'
+        # (e.g. a partially hand-edited cache file) must not crash stream_directory's
+        # len(cached['children'])/iteration -- cache_get must reject it as a miss too,
+        # not just check isinstance(dict) + version.
         with disko._cache_lock:
-            disko._cache[disko._cache_key(self.root)] = None
+            disko._cache[disko._cache_key(self.root)] = {
+                'version': disko.CACHE_VERSION, 'scanned_at': time.time(),
+            }
         self.assertIsNone(disko.cache_get(self.root))
+
+    def test_non_dict_cache_entry_treated_as_miss(self):
+        # A genuinely non-dict, non-None, truthy value: None alone would already be
+        # caught by cache_get's earlier "not a sound entry" check without ever
+        # exercising the isinstance(dict) guard this test is meant to prove.
+        with disko._cache_lock:
+            disko._cache[disko._cache_key(self.root)] = 'oops-a-string'
+        self.assertIsNone(disko.cache_get(self.root))
+        # cache_set must not crash on this malformed entry either (it reads the same
+        # raw _cache dict via its own staleness check).
+        self.assertTrue(disko.cache_set(self.root, []))
 
     def test_delete_persists(self):
         disko.cache_set(self.root, [])
@@ -783,6 +800,17 @@ class TestCacheStaleness(TempTreeMixin, unittest.TestCase):
         self.assertEqual(raw['children'][0]['size'], 99)  # propagation did touch it (raw access)
         self.assertIsNone(disko.cache_get(self.root))  # but it's still unversioned: a miss
 
+    def test_propagation_skips_corrupted_ancestor(self):
+        # A malformed ancestor entry (e.g. a hand-edited or foreign cache file --
+        # cache_load only validates the top-level JSON is a dict, never each per-path
+        # value) must not crash cache_set for a descendant being scanned.
+        big = os.path.join(self.root, 'big')
+        with disko._cache_lock:
+            disko._cache[disko._cache_key(self.root)] = 'not-a-dict'
+        self.assertTrue(disko.cache_set(big, [{'name': 'a', 'path': os.path.join(big, 'a'),
+                                               'size': 99, 'isDir': True}], scanned_at=200.0))
+        self.assertIsNone(disko.cache_get(self.root))  # still corrupted/unrecognized: a miss
+
 
 class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
     def setUp(self):
@@ -874,7 +902,7 @@ class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
         os.mkdir(type_root)
         bucket_files = _make_type_tree(type_root)
         events = self._stream(path=type_root)
-        expected = 1 + len(bucket_files)  # 1 subdir ('sub') + 6 non-empty type buckets
+        expected = len(TYPE_TREE_DIRS) + len(bucket_files)  # fixture's own dirs + non-empty type buckets
         self.assertEqual(events[0]['total_dirs'], expected)
         self.assertEqual(events[0]['total_dirs'], sum(1 for e in events if e['type'] == 'child'))
         names = {e['name'] for e in events if e['type'] == 'child'}

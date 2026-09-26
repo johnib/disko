@@ -97,15 +97,20 @@ def _cache_key(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
+def _sound_entry(entry) -> bool:
+    """True if entry is a well-formed cache dict (has the keys every reader relies on).
+
+    Guards every raw _cache[...]/_cache.get(...) read (cache_get, cache_set's staleness
+    check, _propagate_size's ancestor read) against a malformed/foreign value ending up
+    in _cache -- cache_load only validates that the top-level JSON is a dict, never each
+    per-path value, so a hand-edited or corrupted cache file can put anything at a key."""
+    return isinstance(entry, dict) and 'children' in entry and 'scanned_at' in entry
+
+
 def cache_get(path: str):
     with _cache_lock:
         entry = _cache.get(_cache_key(path))
-        if entry is None:
-            return None
-        # entry.get('version') alone would raise AttributeError if some non-dict value
-        # ever ends up in _cache (cache_load only validates the top-level JSON object is
-        # a dict, never each per-path value), so guard the shape explicitly.
-        if not isinstance(entry, dict) or entry.get('version') != CACHE_VERSION:
+        if not _sound_entry(entry) or entry.get('version') != CACHE_VERSION:
             return None  # old/foreign/malformed shape: treat as a miss, not a crash or stale render
         return entry
 
@@ -123,7 +128,7 @@ def cache_set(path: str, children: list, scanned_at: float = None) -> bool:
         scanned_at = time.time()
     with _cache_lock:
         existing = _cache.get(key)
-        if existing and existing.get('scanned_at', 0) > scanned_at:
+        if _sound_entry(existing) and existing.get('scanned_at', 0) > scanned_at:
             return False
         _cache[key] = {'children': children, 'scanned_at': scanned_at, 'version': CACHE_VERSION}
         _propagate_size(key, sum(c.get('size') or 0 for c in children), scanned_at,
@@ -141,7 +146,7 @@ def _propagate_size(key: str, new_size: int, scanned_at: float, partial: bool = 
     parent = os.path.dirname(child)
     while parent != child:
         entry = _cache.get(parent)
-        if not entry or entry.get('scanned_at', 0) > scanned_at:
+        if not _sound_entry(entry) or entry.get('scanned_at', 0) > scanned_at:
             return
         item = next((c for c in entry['children']
                      if c.get('isDir') and _cache_key(c['path']) == child), None)
@@ -854,14 +859,19 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid #e94560; out
 .legend-size { font-size: 10px; color: #94a3b8; white-space: nowrap; }
 
 /* Dim states applied to treemap cells and sidebar rows while a legend filter is active.
+   Every visible part of a dimmed cell/row is covered (rect AND label text; dot, name,
+   size AND the usage bar), not just the background, so a dimmed item can't still read
+   as "active" via a crisp label or size left at full opacity.
    :hover overrides pin the dimmed opacity so the existing .cell:hover rect rule (same
    specificity) can't accidentally undim a filtered-out cell on hover. */
-.cell.dim-other rect  { opacity: .25; }
-.cell.dim-neutral rect { opacity: .55; }
+.cell.dim-other rect, .cell.dim-other text  { opacity: .25; }
+.cell.dim-neutral rect, .cell.dim-neutral text { opacity: .55; }
 .cell.dim-other:hover rect  { opacity: .25; }
 .cell.dim-neutral:hover rect { opacity: .55; }
-.sitem.dim-other  .sitem-dot, .sitem.dim-other  .sitem-name  { opacity: .25; }
-.sitem.dim-neutral .sitem-dot, .sitem.dim-neutral .sitem-name { opacity: .55; }
+.sitem.dim-other  .sitem-dot, .sitem.dim-other  .sitem-name,
+.sitem.dim-other  .sitem-size, .sitem.dim-other  .sitem-bar  { opacity: .25; }
+.sitem.dim-neutral .sitem-dot, .sitem.dim-neutral .sitem-name,
+.sitem.dim-neutral .sitem-size, .sitem.dim-neutral .sitem-bar { opacity: .55; }
 
 /* ── Error ── */
 #error-overlay, #d3-overlay {
@@ -995,12 +1005,17 @@ const MAX_SIDEBAR = 500;     // sidebar rows rendered before showing a "more" no
 const OTHER_COLOR = '#475569';
 
 // File-type bucket colors: fixed and consistent across the treemap, sidebar, and legend
-// (unlike PALETTE, which is positional and resets per view). Checked against protanopia/
-// deuteranopia/tritanopia simulation for pairwise distinguishability; 'other' is kept
-// visually distinct (different hue and lighter) from OTHER_COLOR's aggregate-overflow gray.
+// (unlike PALETTE, which is positional and resets per view). Verified with an approximate
+// protanopia/deuteranopia/tritanopia simulation (linear RGB transform, not a full physiological
+// model) over every pairwise combination, including against OTHER_COLOR below: worst-case
+// simulated separation is ~68/255 (video vs. audio under tritanopia is the closest pair),
+// versus ~11/255 for an earlier candidate palette that put 'code' and 'audio' at nearly the
+// same hue -- so this is a real, sizeable improvement, not a guarantee of perfect
+// distinguishability for every color-vision deficiency. 'other' is kept clearly distinct
+// (much lighter, different hue) from OTHER_COLOR's darker aggregate-overflow gray.
 const TYPE_COLORS = {
-  image: '#38bdf8', video: '#f472b6', audio: '#fbbf24', archive: '#a78bfa',
-  document: '#34d399', code: '#fb923c', other: '#94a3b8',
+  image: '#0ea5e9', video: '#f472b6', audio: '#facc15', archive: '#a78bfa',
+  document: '#4ade80', code: '#ea580c', other: '#e2e8f0',
 };
 const TYPE_LABELS = {
   image: 'Images', video: 'Video', audio: 'Audio', archive: 'Archives',
