@@ -217,12 +217,22 @@ def _sound_entry(entry) -> bool:
     per-path value, so a hand-edited or corrupted cache file can put anything at a key,
     including a dict with the right keys but wrong-typed values (e.g. scanned_at: null,
     which would otherwise raise TypeError when compared to a float), or a children list
-    of dicts that are individually missing fields readers assume are always present."""
+    of dicts that are individually missing fields readers assume are always present.
+
+    Also rejects a scanned_at later than the current wall clock. The app itself only
+    ever writes time.time() captured before the scan that produced the entry, so a
+    future value only arises from a clock rollback or hand-edited data -- and unlike
+    every other soundness violation here, this one is otherwise self-perpetuating: a
+    future scanned_at is served as fresh forever (stream_directory's `time.time() -
+    scanned_at < CACHE_TTL` is trivially true), and blocks its own repair (cache_set's
+    newer-scan-wins guard, `existing.get('scanned_at', 0) > scanned_at`, treats it as
+    always winning against any real scan's timestamp)."""
     if not isinstance(entry, dict):
         return False
     children = entry.get('children')
+    scanned_at = entry.get('scanned_at')
     return (isinstance(children, list) and all(_sound_child(c) for c in children)
-            and _finite_number(entry.get('scanned_at')))
+            and _finite_number(scanned_at) and scanned_at <= time.time())
 
 
 def _current_entry(entry) -> bool:

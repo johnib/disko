@@ -1161,6 +1161,40 @@ class TestCacheStaleness(TempTreeMixin, unittest.TestCase):
         self.assertIsNotNone(entry)  # replaced and now a normal, current-version hit
         self.assertEqual(entry['version'], disko.CACHE_VERSION)
 
+    def test_future_dated_current_version_entry_is_repairable(self):
+        # Unlike the old-version case above, a CURRENT-version entry's scanned_at is
+        # normally authoritative (it's meant to win a "newer scan" race) -- so a sound,
+        # current-version entry with an implausible future scanned_at (clock rollback,
+        # or hand-edited data) previously stayed authoritative forever: it was served
+        # as permanently fresh, AND its bogus timestamp made cache_set's newer-scan-
+        # wins guard reject every real scan's replacement, so not even a forced
+        # Refresh could repair it without deleting the cache file by hand.
+        with disko._cache_lock:
+            disko._cache[disko._cache_key(self.root)] = {
+                'children': [], 'scanned_at': time.time() + 1e6, 'version': disko.CACHE_VERSION,
+            }
+        self.assertIsNone(disko.cache_get(self.root))  # bypassed, not served as fresh
+        self.assertTrue(disko.cache_set(self.root, [], scanned_at=time.time()))  # repair succeeds
+        entry = disko.cache_get(self.root)
+        self.assertIsNotNone(entry)
+        self.assertLess(entry['scanned_at'], time.time() + 1)
+
+    def test_stream_repairs_future_dated_current_version_entry(self):
+        # End-to-end companion: streaming a folder whose cache entry is future-dated
+        # must run a live scan (not serve the poisoned entry as a permanent cache hit),
+        # and the live scan's result must actually replace it for the next access.
+        with disko._cache_lock:
+            disko._cache[disko._cache_key(self.root)] = {
+                'children': [], 'scanned_at': time.time() + 1e6, 'version': disko.CACHE_VERSION,
+            }
+        events = []
+        disko.stream_directory(self.root, lambda d: d is not None and events.append(d))
+        self.assertFalse(events[0]['from_cache'])
+        self.assertIn('big', [e.get('name') for e in events if e['type'] == 'child'])
+        entry = disko.cache_get(self.root)
+        self.assertIsNotNone(entry)
+        self.assertLess(entry['scanned_at'], time.time() + 1)
+
     def test_propagation_skips_corrupted_ancestor(self):
         # A malformed ancestor entry (e.g. a hand-edited or foreign cache file --
         # cache_load only validates the top-level JSON is a dict, never each per-path
