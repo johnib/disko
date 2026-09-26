@@ -255,7 +255,9 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <title>Disk Explorer</title>
-<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"
+  integrity="sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i"
+  crossorigin="anonymous"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -380,14 +382,14 @@ body {
 .sitem-bar { height: 100%; border-radius: 1px; opacity: .45; }
 
 /* ── Error ── */
-#error-overlay {
+#error-overlay, #d3-overlay {
   position: absolute; inset: 0; display: none;
   align-items: center; justify-content: center; flex-direction: column; gap: 8px;
   background: rgba(17,19,24,.7);
 }
-#error-overlay.show { display: flex; }
-#error-title { color: #e94560; font-size: 15px; font-weight: 600; }
-#error-detail { color: #475569; font-size: 12px; }
+#error-overlay.show, #d3-overlay.show { display: flex; }
+#error-title, #d3-title { color: #e94560; font-size: 15px; font-weight: 600; }
+#error-detail, #d3-detail { color: #475569; font-size: 12px; }
 
 /* ── Tooltip ── */
 #tooltip {
@@ -426,6 +428,11 @@ body {
     <div id="error-overlay">
       <div id="error-title">⚠ Could not scan</div>
       <div id="error-detail"></div>
+    </div>
+    <div id="d3-overlay">
+      <div id="d3-title">⚠ Treemap unavailable</div>
+      <div id="d3-detail">Could not load the D3 library from cdn.jsdelivr.net (offline or CDN blocked).
+        The sidebar list still works.</div>
     </div>
   </div>
   <div id="sidebar">
@@ -573,8 +580,8 @@ function goToPath() {
 function render(data) {
   currentData = data;
   renderBreadcrumb();
-  renderTreemap(data);
   renderSidebar(data);
+  renderTreemap(data);
   document.getElementById('back-btn').classList.toggle('visible', navStack.length > 0);
   document.querySelector('#total-size span').textContent = fmt(data.size);
 }
@@ -582,8 +589,8 @@ function render(data) {
 // Partial update (during streaming) - skip nav stack update
 function renderData(data) {
   currentData = data;
-  renderTreemap(data);
   renderSidebar(data);
+  renderTreemap(data);
   document.querySelector('#total-size span').textContent = fmt(data.size);
 }
 
@@ -634,7 +641,14 @@ function hideCacheBadge() {
 }
 
 // ── Treemap ──────────────────────────────────────────────────
+function d3Available() {
+  const ok = typeof d3 !== 'undefined';
+  document.getElementById('d3-overlay').classList.toggle('show', !ok);
+  return ok;
+}
+
 function renderTreemap(data) {
+  if (!d3Available()) return;
   const wrap = document.getElementById('treemap-wrap');
   const W = wrap.clientWidth-20, H = wrap.clientHeight-20;
   const svg = d3.select('#treemap').attr('width',W).attr('height',H);
@@ -744,6 +758,7 @@ window.addEventListener('keydown', e => {
   if (e.key==='Backspace'||e.key==='ArrowLeft') goBack();
 });
 
+d3Available();
 navigate("%%DEFAULT_PATH%%", false);
 </script>
 </body>
