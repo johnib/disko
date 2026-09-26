@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 # Point the cache at a throwaway file *before* importing disko, so the real
 # ~/.disko_cache.json is never read or written by the test run.
@@ -64,12 +65,44 @@ def _make_tree(root):
     _write_file(os.path.join(root, 'loose2.txt'), 2000)
 
 
+# Exact bucket membership (standalone fixture, independent of _make_tree so bucket-count
+# expectations are unambiguous): image, video, archive, document, code, other -- 6 non-empty
+# buckets, no audio bucket present.
+TYPE_TREE_DIRS = {'sub'}
+TYPE_TREE_BUCKET_FILES = {
+    'image': ['photo.jpg', 'IMG.JPG'],
+    'video': ['clip.mp4'],
+    'archive': ['notes.zip', 'backup.tar.gz'],
+    'document': ['report.pdf'],
+    'code': ['script.py'],
+    'other': ['README', '.bashrc'],
+}
+
+
+def _make_type_tree(root):
+    """Create a tree with loose files spanning multiple file-type buckets; returns
+    {bucket: [filenames]} for the fixture's own bookkeeping (sizes vary per file, see
+    _write_file below -- callers that need exact expected sizes read them from disk)."""
+    os.makedirs(os.path.join(root, 'sub'))
+    sizes = {
+        'photo.jpg': 500, 'IMG.JPG': 700, 'clip.mp4': 900,
+        'notes.zip': 300, 'backup.tar.gz': 400, 'report.pdf': 600,
+        'script.py': 200, 'README': 100, '.bashrc': 150,
+    }
+    for name, size in sizes.items():
+        _write_file(os.path.join(root, name), size)
+    return TYPE_TREE_BUCKET_FILES
+
+
 class TempTreeMixin(object):
+    #: overridable hook so a subclass can build a different fixture tree
+    _populate_tree = staticmethod(_make_tree)
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='disko-tree-')
         # realpath: on macOS /var is a symlink to /private/var.
         self.root = os.path.realpath(self.tmp)
-        _make_tree(self.root)
+        self._populate_tree(self.root)
         # Cache lives outside the scanned tree so it is not counted as a file.
         self.cache_dir = tempfile.mkdtemp(prefix='disko-cache-')
         self._orig_cache_file = disko.CACHE_FILE
@@ -94,6 +127,12 @@ class TempTreeMixin(object):
         disko._persist_cache = self._orig_persist
         shutil.rmtree(self.cache_dir, ignore_errors=True)
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class TempTypeTreeMixin(TempTreeMixin):
+    """Like TempTreeMixin, but self.root holds _make_type_tree's multi-bucket fixture
+    instead of _make_tree's (a single 'sub' dir plus loose files spanning 6 buckets)."""
+    _populate_tree = staticmethod(_make_type_tree)
 
 
 class TestCacheEnvOverride(unittest.TestCase):
@@ -137,16 +176,18 @@ class TestScanToList(TempTreeMixin, unittest.TestCase):
     def test_scan_tree(self):
         children = disko.scan_to_list(self.root)
         by_name = {c['name']: c for c in children}
-        self.assertEqual(set(by_name), {'big', 'small', 'empty', '(loose files)'})
+        # loose1.txt/loose2.txt both classify as 'document', so they land in one bucket.
+        self.assertEqual(set(by_name), {'big', 'small', 'empty', '(documents)'})
 
         for name in ('big', 'small', 'empty'):
             c = by_name[name]
             self.assertTrue(c['isDir'])
             self.assertEqual(c['path'], os.path.join(self.root, name))
 
-        loose = by_name['(loose files)']
+        loose = by_name['(documents)']
         self.assertFalse(loose['isDir'])
         self.assertEqual(loose['path'], self.root)
+        self.assertEqual(loose['fileType'], 'document')
         # Loose files are measured by allocated blocks, like du does for dirs.
         expected = sum(os.lstat(os.path.join(self.root, n)).st_blocks * 512
                        for n in ('loose1.txt', 'loose2.txt'))
@@ -163,7 +204,10 @@ class TestScanToList(TempTreeMixin, unittest.TestCase):
         with open(os.path.join(sub, 'sparse.img'), 'wb') as f:
             f.truncate(1024 * 1024 * 1024)  # 1 GiB apparent, ~0 allocated
         children = disko.scan_to_list(sub)
-        loose = [c for c in children if c['name'] == '(loose files)']
+        # Filter by fileType (any bucket), not by a literal name: 'sparse.img' has no
+        # recognized extension and lands in 'other', not '(loose files)'/'(documents)'.
+        loose = [c for c in children if c.get('fileType') is not None]
+        self.assertTrue(loose)
         total = sum(c['size'] for c in loose)
         self.assertLess(total, 64 * 1024 * 1024)
 
@@ -204,7 +248,7 @@ class TestScanToList(TempTreeMixin, unittest.TestCase):
 
     def test_scan_normalizes_path(self):
         children = disko.scan_to_list(self.root + os.sep + '.' + os.sep)
-        self.assertEqual({c['name'] for c in children}, {'big', 'small', 'empty', '(loose files)'})
+        self.assertEqual({c['name'] for c in children}, {'big', 'small', 'empty', '(documents)'})
 
     def test_scan_unreadable_returns_none(self):
         # None (not []) so callers skip caching an unreadable/missing directory.
@@ -219,6 +263,94 @@ class TestScanToList(TempTreeMixin, unittest.TestCase):
 
     def test_scan_empty_dir(self):
         self.assertEqual(disko.scan_to_list(os.path.join(self.root, 'empty')), [])
+
+
+class TestClassifyFile(unittest.TestCase):
+    def test_common_extensions_map_to_expected_bucket(self):
+        cases = {
+            'photo.jpg': 'image', 'movie.mp4': 'video', 'song.mp3': 'audio',
+            'archive.zip': 'archive', 'report.pdf': 'document', 'script.py': 'code',
+        }
+        for name, expected in cases.items():
+            self.assertEqual(disko.classify_file(name), expected, name)
+
+    def test_case_insensitive(self):
+        self.assertEqual(disko.classify_file('IMG.JPG'), 'image')
+        self.assertEqual(disko.classify_file('Movie.MP4'), 'video')
+
+    def test_unmatched_and_extensionless_fall_to_other(self):
+        self.assertEqual(disko.classify_file('data.xyz123'), 'other')
+        self.assertEqual(disko.classify_file('noextension'), 'other')
+        self.assertEqual(disko.classify_file('.bashrc'), 'other')  # dotfile, no real extension
+
+    def test_compound_archive_suffixes(self):
+        # NOTE: every suffix here (gz/bz2/xz/zst/lz4) is ALSO independently mapped to
+        # 'archive' in FILE_TYPE_EXTENSIONS, so this loop passes via the single-suffix
+        # fallback alone for every case -- it is an end-user-correctness check, not proof
+        # the compound branch itself executed. See test_compound_suffix_branch_is_actually_exercised.
+        for suffix in disko.COMPOUND_ARCHIVE_SUFFIXES:
+            self.assertEqual(disko.classify_file(f'x.{suffix}'), 'archive', suffix)
+
+    def test_compound_suffix_branch_is_actually_exercised(self):
+        # Remove 'gz's own standalone mapping so a pass can only come from the
+        # COMPOUND_ARCHIVE_SUFFIXES branch -- this is the actual regression guard.
+        with mock.patch.dict(disko._EXT_TO_TYPE):
+            del disko._EXT_TO_TYPE['gz']
+            self.assertEqual(disko.classify_file('x.tar.gz'), 'archive')
+
+    def test_case_insensitive_compound_suffix(self):
+        self.assertEqual(disko.classify_file('ARCHIVE.TAR.GZ'), 'archive')
+
+    def test_no_extension_listed_in_multiple_buckets(self):
+        seen = {}
+        for bucket, exts in disko.FILE_TYPE_EXTENSIONS.items():
+            for ext in exts:
+                self.assertNotIn(ext, seen, f'{ext!r} listed in both {seen.get(ext)!r} and {bucket!r}')
+                seen[ext] = bucket
+
+
+class TestScanToListTypeBuckets(TempTypeTreeMixin, unittest.TestCase):
+    def _alloc(self, name):
+        return os.lstat(os.path.join(self.root, name)).st_blocks * 512
+
+    def test_multiple_buckets_appear_with_correct_sizes(self):
+        children = disko.scan_to_list(self.root)
+        by_type = {c['fileType']: c for c in children if c.get('fileType')}
+        self.assertEqual(set(by_type), set(TYPE_TREE_BUCKET_FILES))
+        for bucket, names in TYPE_TREE_BUCKET_FILES.items():
+            expected = sum(self._alloc(n) for n in names)
+            self.assertEqual(by_type[bucket]['size'], expected, bucket)
+            self.assertFalse(by_type[bucket]['isDir'])
+            self.assertEqual(by_type[bucket]['path'], self.root)
+
+    def test_single_type_folder_yields_one_bucket(self):
+        # A folder with only .txt files (all 'document') yields exactly one bucket
+        # child -- no phantom empty buckets for the types that aren't present.
+        only_txt = os.path.join(self.root, 'only_txt')
+        os.mkdir(only_txt)
+        _write_file(os.path.join(only_txt, 'a.txt'), 100)
+        _write_file(os.path.join(only_txt, 'b.txt'), 200)
+        children = disko.scan_to_list(only_txt)
+        buckets = [c for c in children if c.get('fileType')]
+        self.assertEqual(len(buckets), 1)
+        self.assertEqual(buckets[0]['fileType'], 'document')
+
+    def test_mixed_case_and_compound_extension_classified_correctly(self):
+        children = disko.scan_to_list(self.root)
+        by_type = {c['fileType']: c for c in children if c.get('fileType')}
+        # photo.jpg + IMG.JPG (mixed case) must BOTH land in 'image', not just the lowercase one.
+        self.assertEqual(by_type['image']['size'], self._alloc('photo.jpg') + self._alloc('IMG.JPG'))
+        # notes.zip + backup.tar.gz (compound suffix) must BOTH land in 'archive'.
+        self.assertEqual(by_type['archive']['size'], self._alloc('notes.zip') + self._alloc('backup.tar.gz'))
+
+    def test_dotfile_with_no_extension_lands_in_other(self):
+        children = disko.scan_to_list(self.root)
+        by_type = {c['fileType']: c for c in children if c.get('fileType')}
+        # README (no extension) + .bashrc (dotfile, no real extension) both land in 'other',
+        # visibly contributing a nonzero size -- not invisible.
+        expected = self._alloc('README') + self._alloc('.bashrc')
+        self.assertEqual(by_type['other']['size'], expected)
+        self.assertGreater(by_type['other']['size'], 0)
 
 
 class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
@@ -239,6 +371,20 @@ class TestCacheRoundTrip(TempTreeMixin, unittest.TestCase):
         self.assertIsNotNone(entry)
         self.assertEqual(entry['children'], children)
         self.assertIsInstance(entry['scanned_at'], float)
+        self.assertEqual(entry.get('version'), disko.CACHE_VERSION)
+
+    def test_old_format_entry_is_treated_as_miss(self):
+        # No 'version' key at all (the pre-v2 on-disk shape): cache_get must treat it as
+        # a miss (triggering exactly one clean re-scan), not crash or render stale data.
+        with open(disko.CACHE_FILE, 'w') as f:
+            json.dump({self.root: {'children': [], 'scanned_at': time.time()}}, f)
+        disko.cache_load()
+        self.assertIsNone(disko.cache_get(self.root))
+
+    def test_non_dict_cache_entry_treated_as_miss(self):
+        with disko._cache_lock:
+            disko._cache[disko._cache_key(self.root)] = None
+        self.assertIsNone(disko.cache_get(self.root))
 
     def test_delete_persists(self):
         disko.cache_set(self.root, [])
@@ -346,6 +492,21 @@ class TestBoundedScanning(TempTreeMixin, unittest.TestCase):
     def test_fresh_cache_hit_does_not_refresh(self):
         events = self._cache_hit_events(0)
         self.assertEqual([e['type'] for e in events], ['start', 'done'])
+
+    def test_stream_rescans_once_after_version_bump(self):
+        # Simulate a pre-upgrade cache entry (no 'version' key) already in memory --
+        # cache_get must treat it as a miss exactly once, then a normal cache hit
+        # after the live scan re-populates it in the current shape.
+        with disko._cache_lock:
+            disko._cache[disko._cache_key(self.root)] = {'children': [], 'scanned_at': time.time()}
+        events_1 = []
+        disko.stream_directory(self.root, lambda d: d is not None and events_1.append(d))
+        self.assertFalse(events_1[0]['from_cache'])
+        events_2 = []
+        disko.stream_directory(self.root, lambda d: d is not None and events_2.append(d))
+        self.assertTrue(events_2[0]['from_cache'])
+        entry = disko.cache_get(self.root)
+        self.assertEqual(entry['version'], disko.CACHE_VERSION)
 
     def test_stale_cache_hit_revalidates_in_stream(self):
         stale_at = time.time() - disko.CACHE_TTL - 10
@@ -603,6 +764,25 @@ class TestCacheStaleness(TempTreeMixin, unittest.TestCase):
                         scanned_at=200.0)
         self.assertEqual(disko.cache_get(self.root)['children'][0]['size'], 10)
 
+    def test_ancestor_touched_by_propagation_still_treated_as_miss(self):
+        # Seed an old-format (no 'version' key) ancestor entry, then trigger cache_set on
+        # a descendant so _propagate_size touches the ancestor's children/size in place.
+        # _propagate_size deliberately never stamps 'version' on an entry it only touches
+        # via propagation (its OWN children may still be old-shaped), so the ancestor must
+        # still read as a miss afterward -- proving that non-stamping behavior end-to-end.
+        big = os.path.join(self.root, 'big')
+        with disko._cache_lock:
+            disko._cache[disko._cache_key(self.root)] = {
+                'children': [{'name': 'big', 'path': big, 'size': 10, 'isDir': True}],
+                'scanned_at': 100.0,
+            }
+        disko.cache_set(big, [{'name': 'a', 'path': os.path.join(big, 'a'), 'size': 99, 'isDir': True}],
+                        scanned_at=200.0)
+        with disko._cache_lock:
+            raw = disko._cache[disko._cache_key(self.root)]
+        self.assertEqual(raw['children'][0]['size'], 99)  # propagation did touch it (raw access)
+        self.assertIsNone(disko.cache_get(self.root))  # but it's still unversioned: a miss
+
 
 class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
     def setUp(self):
@@ -630,9 +810,9 @@ class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
         finally:
             conn.close()
 
-    def _stream(self, extra=''):
+    def _stream(self, extra='', path=None):
         from urllib.parse import quote
-        status, ctype, body = self._get('/stream?path=' + quote(self.root) + extra)
+        status, ctype, body = self._get('/stream?path=' + quote(path or self.root) + extra)
         self.assertEqual(status, 200)
         self.assertTrue(ctype.startswith('text/event-stream'), ctype)
         events = []
@@ -671,18 +851,34 @@ class TestHTTPSmoke(TempTreeMixin, unittest.TestCase):
         self.assertEqual(types[-1], 'done')
         self.assertFalse(events[0]['from_cache'])
         self.assertEqual(events[0]['path'], self.root)
-        # total_dirs counts every child event, including the "(loose files)" entry,
+        # total_dirs counts every child event, including the "(documents)" bucket entry,
         # so the client's progress bar reaches exactly 100%.
         self.assertEqual(events[0]['total_dirs'], 4)
         self.assertEqual(events[0]['total_dirs'], sum(1 for e in events if e['type'] == 'child'))
         names = {e['name'] for e in events if e['type'] == 'child'}
-        self.assertEqual(names, {'big', 'small', 'empty', '(loose files)'})
+        self.assertEqual(names, {'big', 'small', 'empty', '(documents)'})
 
         # Second request is served from the cache populated by the first.
         events = self._stream()
         self.assertEqual(events[0]['type'], 'start')
         self.assertTrue(events[0]['from_cache'])
         self.assertEqual(events[-1]['type'], 'done')
+
+    def test_stream_total_dirs_correct_with_multiple_buckets(self):
+        # This fixture's own dir ('sub') is counted as its total_dirs still uses the
+        # unqualified dir count from _list_entries, +1 -- this is exactly the case where
+        # the pre-fix formula (len(dirs) + (1 if any bucket nonempty else 0)) undercounts:
+        # for this fixture it would have produced 1+1=2, strictly less than the 7 buckets
+        # actually stream, which is how this test would have caught the regression.
+        type_root = os.path.join(self.root, 'types')
+        os.mkdir(type_root)
+        bucket_files = _make_type_tree(type_root)
+        events = self._stream(path=type_root)
+        expected = 1 + len(bucket_files)  # 1 subdir ('sub') + 6 non-empty type buckets
+        self.assertEqual(events[0]['total_dirs'], expected)
+        self.assertEqual(events[0]['total_dirs'], sum(1 for e in events if e['type'] == 'child'))
+        names = {e['name'] for e in events if e['type'] == 'child'}
+        self.assertEqual(names, {'sub', '(images)', '(video)', '(archives)', '(documents)', '(code)', '(other)'})
 
     def test_stream_missing_path_errors(self):
         from urllib.parse import quote

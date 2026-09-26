@@ -28,6 +28,8 @@ _verbose = False  # --verbose: log HTTP requests
 SCAN_WORKERS = 12   # max concurrent du processes (global cap across all scans and prefetches)
 PREFETCH_WORKERS = 4  # background prefetch workers
 CACHE_FILE = os.path.expanduser(os.environ.get('DISKO_CACHE') or '~/.disko_cache.json')
+CACHE_VERSION = 2  # bump when the cached child-dict shape changes incompatibly
+                    # (v2: loose files became per-type-bucket entries with 'fileType')
 PREFETCH_TOP_N = 10  # prefetch top-N largest subdirs after each scan
 PREFETCH_MAX_DEPTH = 1  # how many levels below a scanned dir to prefetch
 CACHE_TTL = 300  # seconds; older cache hits are served, then re-scanned and re-streamed
@@ -97,7 +99,15 @@ def _cache_key(path: str) -> str:
 
 def cache_get(path: str):
     with _cache_lock:
-        return _cache.get(_cache_key(path))
+        entry = _cache.get(_cache_key(path))
+        if entry is None:
+            return None
+        # entry.get('version') alone would raise AttributeError if some non-dict value
+        # ever ends up in _cache (cache_load only validates the top-level JSON object is
+        # a dict, never each per-path value), so guard the shape explicitly.
+        if not isinstance(entry, dict) or entry.get('version') != CACHE_VERSION:
+            return None  # old/foreign/malformed shape: treat as a miss, not a crash or stale render
+        return entry
 
 
 def cache_set(path: str, children: list, scanned_at: float = None) -> bool:
@@ -115,7 +125,7 @@ def cache_set(path: str, children: list, scanned_at: float = None) -> bool:
         existing = _cache.get(key)
         if existing and existing.get('scanned_at', 0) > scanned_at:
             return False
-        _cache[key] = {'children': children, 'scanned_at': scanned_at}
+        _cache[key] = {'children': children, 'scanned_at': scanned_at, 'version': CACHE_VERSION}
         _propagate_size(key, sum(c.get('size') or 0 for c in children), scanned_at,
                         any(c.get('status') for c in children))
     cache_save()
@@ -332,23 +342,68 @@ def _cacheable(children) -> bool:
     return children is not None and all(c.get('size') is not None for c in children)
 
 
-def _list_entries(path: str):
-    """Return (subdirs, loose file total) for path. Raises OSError if it can't be listed.
+FILE_TYPE_EXTENSIONS = {
+    'image':   {'jpg', 'jpeg', 'png', 'gif', 'heic', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'raw', 'cr2', 'nef', 'ico'},
+    'video':   {'mp4', 'mov', 'mkv', 'avi', 'webm', 'm4v', 'flv', 'wmv', 'mpg', 'mpeg'},
+    'audio':   {'mp3', 'wav', 'flac', 'aac', 'm4a', 'ogg', 'wma', 'opus'},
+    'archive': {'zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar', 'dmg', 'iso', 'zst', 'lz4'},
+    'document': {'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'md', 'epub', 'rtf', 'odt', 'csv'},
+    'code':    {'py', 'js', 'ts', 'jsx', 'tsx', 'go', 'rs', 'c', 'cc', 'cpp', 'h', 'hpp', 'java', 'json',
+                'yaml', 'yml', 'html', 'css', 'sh', 'rb', 'php', 'swift', 'kt'},
+}
+# Checked before the last single suffix: os.path.splitext only sees the last dot-segment,
+# so 'archive.tar.zst' would otherwise fall to 'other'. Every suffix here also has its
+# trailing segment (gz/bz2/xz/zst/lz4) independently mapped to 'archive' above (a lone
+# gzipped file is legitimately an archive too), so this branch is redundant for every
+# case currently listed -- it exists for a future compound suffix whose trailing segment
+# ISN'T independently archive-mapped, and is cheap and self-documenting either way.
+COMPOUND_ARCHIVE_SUFFIXES = {'tar.gz', 'tar.bz2', 'tar.xz', 'tar.zst', 'tar.lz4'}
 
-    Loose files are measured by allocated size (_alloc_size), like du."""
+_EXT_TO_TYPE = {ext: t for t, exts in FILE_TYPE_EXTENSIONS.items() for ext in exts}
+
+_BUCKET_LABELS = {'image': 'images', 'video': 'video', 'audio': 'audio',
+                   'archive': 'archives', 'document': 'documents', 'code': 'code', 'other': 'other'}
+
+
+def classify_file(name: str) -> str:
+    """Return name's file-type bucket (image/video/audio/archive/document/code/other).
+
+    Case-insensitive; checks the last two dot-segments against COMPOUND_ARCHIVE_SUFFIXES
+    before falling back to the single last suffix. 'other' covers unmatched, extensionless,
+    and dotfile-with-no-extension names -- this function never raises."""
+    lower = name.lower()
+    parts = lower.rsplit('.', 2)
+    if len(parts) == 3 and '.'.join(parts[1:]) in COMPOUND_ARCHIVE_SUFFIXES:
+        return 'archive'
+    ext = os.path.splitext(lower)[1].lstrip('.')
+    return _EXT_TO_TYPE.get(ext, 'other')
+
+
+def _list_entries(path: str):
+    """Return (subdirs, file_totals) for path. Raises OSError if it can't be listed.
+
+    file_totals is {type_bucket: summed_allocated_size}, classified via classify_file();
+    loose files are measured by allocated size (_alloc_size), like du."""
     entries = list(os.scandir(path))
     dirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
-    file_total = sum(_alloc_size(e) for e in entries if not e.is_dir(follow_symlinks=False))
-    return dirs, file_total
+    file_totals: dict = {}
+    for e in entries:
+        if e.is_dir(follow_symlinks=False):
+            continue
+        bucket = classify_file(e.name)
+        file_totals[bucket] = file_totals.get(bucket, 0) + _alloc_size(e)
+    return dirs, file_totals
 
 
-def _iter_children(path: str, dirs: list, file_total: int, stop=None, background=None):
+def _iter_children(path: str, dirs: list, file_totals: dict, stop=None, background=None):
     """Yield path's child dicts: mount points first (never du'ed), then each subdir
-    as its du completes, then the "(loose files)" entry.
+    as its du completes, then one entry per non-empty file-type bucket (e.g.
+    '(images)', '(documents)'), each carrying 'fileType' so the frontend can
+    color/group/filter loose files by type.
 
     Yields None every HEARTBEAT_SECS while waiting on du, so a streaming caller can
     send a keepalive (and notice a disconnected client). If `stop` gets set, queued
-    du calls are skipped and iteration ends early without the loose-files entry.
+    du calls are skipped and iteration ends early without the bucket entries.
     Pending du work is cancelled when the generator is closed or exhausted.
     """
     dirs, mounts = _split_mounts(path, dirs)
@@ -374,12 +429,15 @@ def _iter_children(path: str, dirs: list, file_total: int, stop=None, background
     if stop is not None and stop.is_set():
         return
 
-    if file_total > 0:
+    for bucket, total in sorted(file_totals.items()):
+        if total <= 0:
+            continue
         yield {
-            'name': '(loose files)',
+            'name': f'({_BUCKET_LABELS.get(bucket, bucket)})',
             'path': path,
-            'size': file_total,
+            'size': total,
             'isDir': False,
+            'fileType': bucket,
         }
 
 
@@ -389,11 +447,11 @@ def scan_to_list(path: str, background=None):
     `background` is passed to du_bounded ('prefetch' / 'revalidate')."""
     path = _resolve_scan_path(path)
     try:
-        dirs, file_total = _list_entries(path)
+        dirs, file_totals = _list_entries(path)
     except OSError:
         return None
 
-    children = [c for c in _iter_children(path, dirs, file_total, background=background) if c is not None]
+    children = [c for c in _iter_children(path, dirs, file_totals, background=background) if c is not None]
     children.sort(key=_size_key)
     return children
 
@@ -586,14 +644,16 @@ def stream_directory(path: str, write_event, force: bool = False, stop=None):
     # Live scan
     started = time.time()
     try:
-        dirs, file_total = _list_entries(path)
+        dirs, file_totals = _list_entries(path)
     except OSError as e:
         write_event({'type': 'error', 'error': str(e)})
         return
 
-    # Counted before the mount split (mounts are emitted as children too), +1 for the
-    # "(loose files)" entry sent after the dirs, so progress never exceeds 100%.
-    total_dirs = len(dirs) + (1 if file_total > 0 else 0)
+    # Counted before the mount split (mounts are emitted as children too), plus one slot
+    # per non-empty type bucket that _iter_children will yield after the dirs, so progress
+    # never exceeds 100% even when loose files span multiple buckets.
+    nonempty_buckets = sum(1 for v in file_totals.values() if v > 0)
+    total_dirs = len(dirs) + nonempty_buckets
 
     write_event({
         'type': 'start',
@@ -605,7 +665,7 @@ def stream_directory(path: str, write_event, force: bool = False, stop=None):
 
     collected = []
     with live_scan():  # background du work yields to this scan
-        children = _iter_children(path, dirs, file_total, stop)
+        children = _iter_children(path, dirs, file_totals, stop)
         try:
             for child in children:
                 if child is None:
@@ -780,6 +840,29 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid #e94560; out
 .sitem-bar-wrap { height: 2px; background: #1e2535; border-radius: 1px; margin-left: 15px; width: calc(100% - 15px); }
 .sitem-bar { height: 100%; border-radius: 1px; opacity: .45; }
 
+/* ── Legend ── */
+#legend { display: none; flex-direction: column; gap: 2px; padding: 8px 16px 6px; border-bottom: 1px solid #1e2535; }
+.legend-caption { font-size: 10px; color: #8391a7; margin-bottom: 3px; }
+.legend-item {
+  display: flex; align-items: center; gap: 7px; padding: 3px 4px; border-radius: 5px;
+  cursor: pointer; transition: background .15s;
+}
+.legend-item:hover { background: #1e2535; }
+.legend-item[aria-pressed="true"] { background: #1e2535; }
+.legend-swatch { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.legend-label { flex: 1; font-size: 11px; color: #cbd5e1; }
+.legend-size { font-size: 10px; color: #94a3b8; white-space: nowrap; }
+
+/* Dim states applied to treemap cells and sidebar rows while a legend filter is active.
+   :hover overrides pin the dimmed opacity so the existing .cell:hover rect rule (same
+   specificity) can't accidentally undim a filtered-out cell on hover. */
+.cell.dim-other rect  { opacity: .25; }
+.cell.dim-neutral rect { opacity: .55; }
+.cell.dim-other:hover rect  { opacity: .25; }
+.cell.dim-neutral:hover rect { opacity: .55; }
+.sitem.dim-other  .sitem-dot, .sitem.dim-other  .sitem-name  { opacity: .25; }
+.sitem.dim-neutral .sitem-dot, .sitem.dim-neutral .sitem-name { opacity: .55; }
+
 /* ── Error ── */
 #error-overlay, #d3-overlay {
   position: absolute; inset: 0; display: none;
@@ -826,6 +909,7 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid #e94560; out
 .tt-size { font-size: 18px; font-weight: 700; color: #f26b83; }
 .tt-pct  { font-size: 11px; color: #94a3b8; margin-top: 2px; }
 .tt-cached { font-size: 10px; color: #94a3b8; margin-top: 4px; }
+.tt-type { font-size: 11px; color: #94a3b8; margin-top: 2px; }
 .tt-hint { margin-top: 8px; font-size: 11px; color: #8391a7; border-top: 1px solid #2d3748; padding-top: 7px; }
 
 /* ── Narrow windows ── */
@@ -890,6 +974,8 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid #e94560; out
         </span>
       </div>
     </div>
+    <div id="legend" role="group" aria-label="File types in this folder"></div>
+    <div id="legend-status" class="sr-only" aria-live="polite"></div>
     <div id="sidebar-list"></div>
   </div>
 </div>
@@ -907,6 +993,25 @@ const PALETTE = [
 const MAX_LEAVES = 500;      // treemap cells rendered before aggregating the rest
 const MAX_SIDEBAR = 500;     // sidebar rows rendered before showing a "more" note
 const OTHER_COLOR = '#475569';
+
+// File-type bucket colors: fixed and consistent across the treemap, sidebar, and legend
+// (unlike PALETTE, which is positional and resets per view). Checked against protanopia/
+// deuteranopia/tritanopia simulation for pairwise distinguishability; 'other' is kept
+// visually distinct (different hue and lighter) from OTHER_COLOR's aggregate-overflow gray.
+const TYPE_COLORS = {
+  image: '#38bdf8', video: '#f472b6', audio: '#fbbf24', archive: '#a78bfa',
+  document: '#34d399', code: '#fb923c', other: '#94a3b8',
+};
+const TYPE_LABELS = {
+  image: 'Images', video: 'Video', audio: 'Audio', archive: 'Archives',
+  document: 'Documents', code: 'Code', other: 'Other',
+};
+function colorForNode(data, siblingIdx) {
+  if (data.fileType) return TYPE_COLORS[data.fileType] || TYPE_COLORS.other;
+  return PALETTE[siblingIdx % PALETTE.length];
+}
+
+let activeFilterType = null;  // single file-type bucket key being highlighted, or null (one at a time)
 
 let navStack = [];
 let currentData = null;
@@ -957,18 +1062,30 @@ function parentOf(p) {
   return i <= 0 ? '/' : t.slice(0, i);
 }
 
-// Keep the largest (max-1) items and fold the rest into one aggregate entry.
+// Shared bucket-exemption partition: type-bucket nodes (loose-file groups) are always
+// kept whole; only ordinary subfolders/mounts are subject to the size-ranked cap. Used
+// by both the treemap's capChildren (folds the rest into an aggregate row) and the
+// sidebar's MAX_SIDEBAR truncation (just stops rendering more) so a bucket can never be
+// silently dropped from one view while still shown in the other.
+function selectVisible(children, maxSlots) {
+  const buckets = children.filter(c => c.fileType);
+  const others  = children.filter(c => !c.fileType);
+  const budget = Math.max(0, maxSlots - buckets.length);
+  const sorted = others.slice().sort((a,b) => (b.size||0)-(a.size||0));
+  return { buckets, kept: sorted.slice(0, budget), rest: sorted.slice(budget) };
+}
+
+// Keep every type bucket plus the largest ordinary items, folding the rest into one
+// aggregate entry (reserving one slot for it).
 function capChildren(children, max, parentPath) {
   if (children.length <= max) return children;
-  const sorted = children.slice().sort((a,b) => (b.size||0)-(a.size||0));
-  const kept = sorted.slice(0, max-1), rest = sorted.slice(max-1);
+  const { buckets, kept, rest } = selectVisible(children, max - 1);
   const size = rest.reduce((s,c) => s+(c.size||0), 0);
   const agg = { name: `${rest.length} smaller items`, path: parentPath||'',
                 size, isDir: false, aggregate: true };
   // Folded entries with partial/unknown sizes make the aggregate a lower bound.
   if (rest.some(c => c.status)) agg.status = 'partial';
-  kept.push(agg);
-  return kept;
+  return rest.length ? buckets.concat(kept, [agg]) : buckets.concat(kept);
 }
 
 // ── Render batching ─────────────────────────────────────────
@@ -1109,6 +1226,7 @@ function navigate(path, force, onCommit) {
 }
 
 function goTo(path, force) {
+  activeFilterType = null;  // a different folder has an unrelated set of type buckets
   const prev = currentData;
   navigate(path, force, () => { if (prev) navStack.push(prev); });
 }
@@ -1174,6 +1292,7 @@ function goUp() {
 
 function goBack() {
   if (!navStack.length) return;
+  activeFilterType = null;  // a different folder has an unrelated set of type buckets
   cancelStream();
   const prev = navStack.pop();
   currentData = prev;
@@ -1185,6 +1304,7 @@ function goToPath() {
   if (!val) return false;
   document.getElementById('path-input').blur();
   navigate(val, false, () => {
+    activeFilterType = null;  // a different folder has an unrelated set of type buckets
     navStack = [];
     document.getElementById('path-input').value = '';
   });
@@ -1198,6 +1318,7 @@ function render(data) {
   renderBreadcrumb();
   renderSidebar(data);
   renderTreemap(data);
+  renderLegend(data);
   updateEmptyState(data);
   document.getElementById('back-btn').classList.toggle('visible', navStack.length > 0);
   document.getElementById('up-btn').disabled = !data.path || data.path === '/';
@@ -1223,6 +1344,7 @@ function renderData(data) {
   currentData = data;
   renderSidebar(data);
   renderTreemap(data);
+  renderLegend(data);
   document.querySelector('#total-size span').textContent = fmt(data.size);
 }
 
@@ -1336,6 +1458,7 @@ function showTooltip(d, totalVal, x, y) {
     el('div', 'tt-path', d.data.path),
     el('div', 'tt-size', sizeLabel(d.data)),
     el('div', 'tt-pct', `${pctOf(d.data.size||0, totalVal)} of this view`));
+  if (d.data.fileType) tooltip.appendChild(el('div', 'tt-type', TYPE_LABELS[d.data.fileType] || d.data.fileType));
   if (d.data.status) tooltip.appendChild(el('div', 'tt-cached', statusText(d.data)));
   if (d.data.isDir!==false) tooltip.appendChild(el('div', 'tt-hint', 'Click to drill down →'));
   tooltip.style.display='block';
@@ -1378,14 +1501,21 @@ function renderTreemap(data) {
   (root.children||[]).forEach((n,i) => { n.colorIdx = i; });
   const colorOf = d => {
     let n=d; while(n.depth>1) n=n.parent;
-    return n.data.aggregate ? OTHER_COLOR : PALETTE[n.colorIdx%PALETTE.length];
+    return n.data.aggregate ? OTHER_COLOR : colorForNode(n.data, n.colorIdx);
   };
   const shade = (hex,depth) => { const c=d3.color(hex); return c?c.darker(depth*.35).toString():hex; };
   const totalVal = knownTotal||1;
 
   const cell = svg.selectAll('g.cell').data(root.leaves()).enter()
-    .append('g').attr('class', d=>'cell'+(d.data.isDir===false?' file':'')
-      +(isUnknown(d.data)?' unknown':(d.data.status?' partial':'')))
+    .append('g').attr('class', d=>{
+      let cls = 'cell'+(d.data.isDir===false?' file':'')
+        +(isUnknown(d.data)?' unknown':(d.data.status?' partial':''));
+      if (activeFilterType) {
+        if (d.data.fileType && d.data.fileType !== activeFilterType) cls += ' dim-other';
+        else if (!d.data.fileType) cls += ' dim-neutral';
+      }
+      return cls;
+    })
     .attr('transform', d=>`translate(${d.x0},${d.y0})`);
 
   cell.append('rect')
@@ -1444,13 +1574,25 @@ function renderSidebar(data) {
   // Mount points have unknown size (0) but are still listed so they can be opened.
   const all = (data.children||[]).filter(c=>hasSizeInfo(c)||c.mount);
   if (!all.length) return;
-  const items = all.length > MAX_SIDEBAR ? all.slice(0, MAX_SIDEBAR) : all;
+  // Type buckets are exempt from the MAX_SIDEBAR cap (selectVisible), so a bucket can
+  // never be dropped from the sidebar while still shown in the treemap (see capChildren).
+  let items = all, hidden = [];
+  if (all.length > MAX_SIDEBAR) {
+    const sel = selectVisible(all, MAX_SIDEBAR);
+    items = sel.buckets.concat(sel.kept).sort((a,b) => (b.size||0)-(a.size||0));
+    hidden = sel.rest;
+  }
   const maxSz = items[0].size||1;
 
   items.forEach((item,i) => {
-    const color = PALETTE[i%PALETTE.length];
+    const color = colorForNode(item, i);
     const isDir = item.isDir!==false;
-    const div = el('div', 'sitem'+(isDir?'':' file')+(item.status?' unknown':'')+(item.mount?' mount':''));
+    let cls = 'sitem'+(isDir?'':' file')+(item.status?' unknown':'')+(item.mount?' mount':'');
+    if (activeFilterType) {
+      if (item.fileType && item.fileType !== activeFilterType) cls += ' dim-other';
+      else if (!item.fileType) cls += ' dim-neutral';
+    }
+    const div = el('div', cls);
     if (item.status) div.title = statusText(item);
     div.style.animationDelay = Math.min(i*20,200)+'ms';
 
@@ -1488,8 +1630,7 @@ function renderSidebar(data) {
     list.appendChild(div);
   });
 
-  if (all.length > items.length) {
-    const hidden = all.slice(items.length);
+  if (hidden.length) {
     const note = document.createElement('div');
     note.className = 'sitem file';
     note.style.animation = 'none';
@@ -1501,6 +1642,51 @@ function renderSidebar(data) {
     note.appendChild(main);
     list.appendChild(note);
   }
+}
+
+// ── Legend (file-type coloring & filtering) ───────────────────
+// View-scoped: totals are for the loose files in the current folder only (subfolders
+// aren't decomposed by type), and the legend states that explicitly in its caption.
+function renderLegend(data) {
+  const box = document.getElementById('legend');
+  box.textContent = '';
+  const totals = {};
+  (data.children || []).forEach(c => { if (c.fileType) totals[c.fileType] = (totals[c.fileType]||0) + (c.size||0); });
+  const present = Object.keys(totals).filter(k => totals[k] > 0);
+  if (!present.length) { box.style.display = 'none'; return; }
+  box.style.display = 'flex';
+  box.appendChild(el('div', 'legend-caption', 'Sizes shown are for loose files in this folder only'));
+  present.sort((a,b) => totals[b]-totals[a]).forEach(bucket => {
+    const item = el('div', 'legend-item');
+    item.setAttribute('role', 'button');
+    item.setAttribute('tabindex', '0');
+    item.setAttribute('aria-pressed', String(activeFilterType === bucket));
+    item.setAttribute('aria-label', `${TYPE_LABELS[bucket] || bucket}, ${fmt(totals[bucket])}`);
+    const swatch = el('span', 'legend-swatch'); swatch.style.background = TYPE_COLORS[bucket] || TYPE_COLORS.other;
+    item.append(swatch, el('span', 'legend-label', TYPE_LABELS[bucket] || bucket),
+                el('span', 'legend-size', fmt(totals[bucket])));
+    item.addEventListener('click', () => toggleFilter(bucket));
+    item.addEventListener('keydown', ev => {
+      if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      ev.preventDefault();  // Space would otherwise also scroll the sidebar/page
+      toggleFilter(bucket);
+    });
+    box.appendChild(item);
+  });
+}
+
+function announceFilter() {
+  document.getElementById('legend-status').textContent = activeFilterType
+    ? `Showing ${TYPE_LABELS[activeFilterType] || activeFilterType} files only`
+    : 'Filter cleared';
+}
+
+// Single active filter type at a time: clicking a second entry replaces it, clicking
+// the active entry again (or Escape) clears it.
+function toggleFilter(bucket) {
+  activeFilterType = (activeFilterType === bucket) ? null : bucket;
+  announceFilter();
+  if (currentData) { renderTreemap(currentData); renderSidebar(currentData); renderLegend(currentData); }
 }
 
 // ── Init ─────────────────────────────────────────────────────
@@ -1518,6 +1704,7 @@ window.addEventListener('keydown', e => {
   const t = e.target;
   if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
   if (e.key==='Backspace'||e.key==='ArrowLeft') { e.preventDefault(); goBack(); }
+  if (e.key==='Escape' && activeFilterType) { e.preventDefault(); toggleFilter(activeFilterType); }
 });
 
 d3Available();

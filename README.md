@@ -18,6 +18,7 @@
 - **Real-time streaming** — directory sizes stream to the browser live via Server-Sent Events (SSE) as the scan progresses
 - **Persistent cache with background refresh** — previously scanned folders load instantly from the cache; entries older than 5 minutes are shown immediately, then re-scanned and the view updates with the fresh sizes when the rescan finishes
 - **Zoomable D3.js treemap** — navigate disk usage visually; click any node to zoom in and explore
+- **File-type color coding** — loose files in the current folder are colored and grouped by type (video, images, documents, ...); a legend shows per-type totals and lets you click a type to highlight matching cells and dim the rest
 - **Breadcrumb navigation** — always know where you are in the tree and jump back to any ancestor in one click
 - **Per-folder refresh** — re-scan any individual folder on demand without restarting the server
 - **Path jump bar** — type any absolute path to jump directly to it
