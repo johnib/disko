@@ -754,7 +754,22 @@ navigate("%%DEFAULT_PATH%%", false);
 # ── HTTP Handler ──────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
+    def _allowed(self):
+        # Block DNS rebinding (Host) and cross-site requests (Origin / Sec-Fetch-Site).
+        port = self.server.server_address[1]
+        hosts = (f'localhost:{port}', f'127.0.0.1:{port}', f'[::1]:{port}')
+        if self.headers.get('Host') not in hosts:
+            return False
+        origin = self.headers.get('Origin')
+        if origin and origin not in tuple(f'http://{h}' for h in hosts):
+            return False
+        return self.headers.get('Sec-Fetch-Site') not in ('cross-site', 'same-site')
+
     def do_GET(self):
+        if not self._allowed():
+            self.send_error(403)
+            return
+
         parsed = urlparse(self.path)
 
         if parsed.path == '/':
@@ -774,7 +789,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Content-Type',  'text/event-stream')
             self.send_header('Cache-Control', 'no-cache')
             self.send_header('X-Accel-Buffering', 'no')
-            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
 
             stop = threading.Event()
@@ -796,7 +810,6 @@ class Handler(BaseHTTPRequestHandler):
             if path:
                 cache_delete(path)
             self.send_response(200)
-            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
 
         else:
