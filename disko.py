@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import subprocess
+import tempfile
 import threading
 import time
 import webbrowser
@@ -29,28 +30,52 @@ PREFETCH_TOP_N = 10  # prefetch top-N largest subdirs after each scan
 
 _cache: dict = {}
 _cache_lock = threading.Lock()
+_save_lock = threading.Lock()
+# Never persist as root: avoids writing a root-owned file into a (possibly sudo-inherited) home dir.
+_persist_cache = not (hasattr(os, 'geteuid') and os.geteuid() == 0)
 
 
 def cache_load():
     global _cache
+    if not _persist_cache:
+        print('  Running as root: cache will not be saved to disk.')
     try:
         with open(CACHE_FILE) as f:
-            _cache = json.load(f)
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError('expected a JSON object')
+        _cache = data
         print(f'  Cache loaded: {len(_cache)} paths from {CACHE_FILE}')
     except FileNotFoundError:
         _cache = {}
     except Exception as e:
-        print(f'  Cache load error: {e}')
+        print(f'  Warning: ignoring unreadable cache file {CACHE_FILE} ({e}); starting with an empty cache')
         _cache = {}
 
 
 def cache_save():
+    if not _persist_cache:
+        return
     with _cache_lock:
+        data = json.dumps(_cache)
+    with _save_lock:
+        tmp = None
         try:
-            with open(CACHE_FILE, 'w') as f:
-                json.dump(_cache, f)
+            # mkstemp creates the file 0600 in the same dir, so os.replace is an atomic rename
+            # that swaps the directory entry (never writes through a symlink at CACHE_FILE).
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CACHE_FILE), prefix='.disko_cache.', suffix='.tmp')
+            with os.fdopen(fd, 'w') as f:
+                f.write(data)
+            os.replace(tmp, CACHE_FILE)
+            tmp = None
         except Exception as e:
             print(f'  Cache save error: {e}')
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
 
 def cache_get(path: str):
